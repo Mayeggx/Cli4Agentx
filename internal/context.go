@@ -185,19 +185,7 @@ func buildTopicHistory(db *sql.DB, runs []CompletedRun) string {
 }
 
 func getSummaryForRun(db *sql.DB, runID, topicID string) string {
-	var summary string
-	err := db.QueryRow(`SELECT summary FROM summaries WHERE run_id = ? LIMIT 1`, runID).Scan(&summary)
-	if err == nil {
-		return summary
-	}
-	err = db.QueryRow(`SELECT s.summary FROM summaries s
-		JOIN runs r ON r.topic_id = s.topic_id
-		WHERE r.id = ? AND s.topic_id = ?
-		ORDER BY ABS(s.created_at - r.started_at) ASC LIMIT 1`, runID, topicID).Scan(&summary)
-	if err == nil {
-		return summary
-	}
-	return ""
+	return SummaryForRunID(runID)
 }
 
 // --- DB helpers ---

@@ -1,7 +1,9 @@
 package internal
 
 import (
+	"bufio"
 	"database/sql"
+	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -25,6 +27,15 @@ type MemoryHit struct {
 	CreatedAt int64
 }
 
+type localRunNote struct {
+	Path       string
+	TopicID    string
+	RunID      string
+	Summary    string
+	UserIntent string
+	CreatedAt  time.Time
+}
+
 func memoryRoot() string {
 	return filepath.Join(dataRoot(), "memory")
 }
@@ -33,8 +44,16 @@ func memoryRunsRoot() string {
 	return filepath.Join(memoryRoot(), "runs")
 }
 
+func memoryArchiveRunsRoot() string {
+	return filepath.Join(memoryRoot(), "archive", "runs")
+}
+
 func memoryRunDayDir(ts time.Time) string {
 	return filepath.Join(memoryRunsRoot(), ts.Format("2006-01-02"))
+}
+
+func memoryLessonsPath() string {
+	return filepath.Join(memoryRoot(), "lessons", "operational-lessons.jsonl")
 }
 
 func ensureMemoryStore() error {
@@ -44,6 +63,7 @@ func ensureMemoryStore() error {
 		filepath.Join(memoryRoot(), "lessons"),
 		filepath.Join(memoryRoot(), "archive"),
 		memoryRunsRoot(),
+		memoryArchiveRunsRoot(),
 	} {
 		if err := os.MkdirAll(dir, 0o755); err != nil {
 			return err
@@ -63,16 +83,16 @@ func SyncLocalMemoryStore(db *sql.DB, topicID, runID, userMessage, summary strin
 			return err
 		}
 	}
-	if err := refreshSessionState(db); err != nil {
+	if err := refreshSessionState(); err != nil {
 		return err
 	}
-	if err := refreshInsightsDigest(db, now); err != nil {
+	if err := refreshInsightsDigest(now); err != nil {
 		return err
 	}
-	if err := refreshLessonsDigest(db); err != nil {
+	if err := refreshLessonsDigest(); err != nil {
 		return err
 	}
-	if err := refreshMemoryOverview(db); err != nil {
+	if err := refreshMemoryOverview(); err != nil {
 		return err
 	}
 	if err := refreshMemoryAbstracts(now); err != nil {
@@ -95,11 +115,6 @@ func CompactLocalMemoryStore(db *sql.DB, keepDays int) (string, error) {
 	}
 
 	cutoff := time.Now().AddDate(0, 0, -(keepDays - 1)).Truncate(24 * time.Hour)
-	archiveRunsRoot := filepath.Join(memoryRoot(), "archive", "runs")
-	if err := os.MkdirAll(archiveRunsRoot, 0o755); err != nil {
-		return "", err
-	}
-
 	movedFiles := 0
 	movedDays := 0
 	for _, entry := range entries {
@@ -112,7 +127,7 @@ func CompactLocalMemoryStore(db *sql.DB, keepDays int) (string, error) {
 		}
 
 		srcDir := filepath.Join(memoryRunsRoot(), entry.Name())
-		dstDir := filepath.Join(archiveRunsRoot, entry.Name())
+		dstDir := filepath.Join(memoryArchiveRunsRoot(), entry.Name())
 		count, err := moveRunDayToArchive(srcDir, dstDir)
 		if err != nil {
 			return "", err
@@ -124,10 +139,10 @@ func CompactLocalMemoryStore(db *sql.DB, keepDays int) (string, error) {
 	}
 
 	now := time.Now()
-	if err := refreshSessionState(db); err != nil {
+	if err := refreshSessionState(); err != nil {
 		return "", err
 	}
-	if err := refreshMemoryOverview(db); err != nil {
+	if err := refreshMemoryOverview(); err != nil {
 		return "", err
 	}
 	if err := refreshMemoryAbstracts(now); err != nil {
@@ -189,37 +204,35 @@ func writeLocalRunNote(topicID, runID, userMessage, summary string, now time.Tim
 	if summary == "" {
 		b.WriteString("(empty)\n")
 	} else {
-		b.WriteString(summary)
+		b.WriteString(strings.TrimSpace(summary))
 		b.WriteString("\n")
 	}
 	if userMessage != "" {
 		b.WriteString("\n## User Intent\n")
-		b.WriteString(userMessage)
+		b.WriteString(strings.TrimSpace(userMessage))
 		b.WriteString("\n")
 	}
 
 	return os.WriteFile(path, []byte(b.String()), 0o644)
 }
 
-func refreshSessionState(db *sql.DB) error {
-	rows, err := db.Query(`SELECT topic_id, COALESCE(run_id, ''), summary, created_at FROM summaries ORDER BY created_at DESC LIMIT ?`, localMemoryRecentView)
+func refreshSessionState() error {
+	notes, err := loadLocalRunNotes(false)
 	if err != nil {
 		return err
 	}
-	defer rows.Close()
+	if len(notes) > localMemoryRecentView {
+		notes = notes[:localMemoryRecentView]
+	}
 
 	var items []string
-	for rows.Next() {
-		var topicID, runID, summary string
-		var createdAt int64
-		if err := rows.Scan(&topicID, &runID, &summary, &createdAt); err != nil {
-			return err
+	for _, note := range notes {
+		ts := note.CreatedAt.Format("01-02 15:04")
+		summary := strings.TrimSpace(note.Summary)
+		if summary == "" {
+			summary = strings.TrimSpace(note.UserIntent)
 		}
-		ts := time.Unix(createdAt, 0).Format("01-02 15:04")
-		items = append(items, fmt.Sprintf("- [%s] topic=%s run=%s %s", ts, topicID, blankFallback(runID, "-"), summary))
-	}
-	if err := rows.Err(); err != nil {
-		return err
+		items = append(items, fmt.Sprintf("- [%s] topic=%s run=%s %s", ts, note.TopicID, blankFallback(note.RunID, "-"), summary))
 	}
 
 	var b strings.Builder
@@ -235,26 +248,27 @@ func refreshSessionState(db *sql.DB) error {
 	return os.WriteFile(filepath.Join(memoryRoot(), "SESSION-STATE.md"), []byte(b.String()), 0o644)
 }
 
-func refreshInsightsDigest(db *sql.DB, now time.Time) error {
+func refreshInsightsDigest(now time.Time) error {
 	monthKey := now.Format("2006-01")
-	rows, err := db.Query(`SELECT summary, created_at FROM summaries WHERE created_at >= ? ORDER BY created_at DESC LIMIT 12`, now.AddDate(0, -1, 0).Unix())
+	notes, err := loadLocalRunNotes(false)
 	if err != nil {
 		return err
 	}
-	defer rows.Close()
 
 	var items []string
-	for rows.Next() {
-		var summary string
-		var createdAt int64
-		if err := rows.Scan(&summary, &createdAt); err != nil {
-			return err
+	for _, note := range notes {
+		if note.CreatedAt.Format("2006-01") != monthKey {
+			continue
 		}
-		ts := time.Unix(createdAt, 0).Format("01-02")
+		summary := strings.TrimSpace(note.Summary)
+		if summary == "" {
+			continue
+		}
+		ts := note.CreatedAt.Format("01-02")
 		items = append(items, fmt.Sprintf("- [%s] %s", ts, summary))
-	}
-	if err := rows.Err(); err != nil {
-		return err
+		if len(items) >= 12 {
+			break
+		}
 	}
 
 	var b strings.Builder
@@ -271,8 +285,8 @@ func refreshInsightsDigest(db *sql.DB, now time.Time) error {
 	return os.WriteFile(path, []byte(b.String()), 0o644)
 }
 
-func refreshLessonsDigest(db *sql.DB) error {
-	facts, err := ListFacts(db)
+func refreshLessonsDigest() error {
+	facts, err := ListFacts(nil)
 	if err != nil {
 		return err
 	}
@@ -286,37 +300,35 @@ func refreshLessonsDigest(db *sql.DB) error {
 	if content != "" {
 		content += "\n"
 	}
-	return os.WriteFile(filepath.Join(memoryRoot(), "lessons", "operational-lessons.jsonl"), []byte(content), 0o644)
+	return os.WriteFile(memoryLessonsPath(), []byte(content), 0o644)
 }
 
-func refreshMemoryOverview(db *sql.DB) error {
-	facts, err := ListFacts(db)
+func refreshMemoryOverview() error {
+	facts, err := ListFacts(nil)
 	if err != nil {
 		return err
 	}
-	rows, err := db.Query(`SELECT topic_id, summary, created_at FROM summaries ORDER BY created_at DESC LIMIT 12`)
+	notes, err := loadLocalRunNotes(false)
 	if err != nil {
 		return err
 	}
-	defer rows.Close()
+	if len(notes) > 12 {
+		notes = notes[:12]
+	}
 
 	var recent []string
-	for rows.Next() {
-		var topicID, summary string
-		var createdAt int64
-		if err := rows.Scan(&topicID, &summary, &createdAt); err != nil {
-			return err
+	for _, note := range notes {
+		ts := note.CreatedAt.Format("01-02 15:04")
+		summary := strings.TrimSpace(note.Summary)
+		if summary == "" {
+			summary = strings.TrimSpace(note.UserIntent)
 		}
-		ts := time.Unix(createdAt, 0).Format("01-02 15:04")
-		recent = append(recent, fmt.Sprintf("- [P1][%s][%s] %s", ts, topicID, summary))
-	}
-	if err := rows.Err(); err != nil {
-		return err
+		recent = append(recent, fmt.Sprintf("- [P1][%s][%s] %s", ts, note.TopicID, summary))
 	}
 
 	var b strings.Builder
 	b.WriteString("# Long-term Memory\n\n")
-	b.WriteString("OpenViking-style lightweight memory layout: P0 facts, P1 distilled summaries, P2 working buffer.\n\n")
+	b.WriteString("Filesystem-only lightweight memory layout: P0 facts, P1 distilled summaries, P2 working buffer.\n\n")
 	b.WriteString("## P0 Stable Facts\n")
 	if len(facts) == 0 {
 		b.WriteString("- (none)\n")
@@ -446,7 +458,7 @@ func localMemoryCandidateFiles(now time.Time) []string {
 		filepath.Join(memoryRoot(), "insights", ".abstract"),
 		filepath.Join(memoryRoot(), "insights", now.Format("2006-01")+".md"),
 		filepath.Join(memoryRoot(), "lessons", ".abstract"),
-		filepath.Join(memoryRoot(), "lessons", "operational-lessons.jsonl"),
+		memoryLessonsPath(),
 	}
 
 	for i := 0; i < localMemoryRecentRuns; i++ {
@@ -642,4 +654,208 @@ func ReadLocalMemoryFile(name string) (string, error) {
 		return "", err
 	}
 	return strings.TrimSpace(string(data)), nil
+}
+
+func readFactFile() ([]Fact, error) {
+	if err := ensureMemoryStore(); err != nil {
+		return nil, err
+	}
+	file, err := os.Open(memoryLessonsPath())
+	if os.IsNotExist(err) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	defer file.Close()
+
+	var facts []Fact
+	scanner := bufio.NewScanner(file)
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if line == "" {
+			continue
+		}
+		var f Fact
+		if err := json.Unmarshal([]byte(line), &f); err != nil {
+			continue
+		}
+		facts = append(facts, f)
+	}
+	if err := scanner.Err(); err != nil {
+		return nil, err
+	}
+	sort.Slice(facts, func(i, j int) bool {
+		if facts[i].CreatedAt == facts[j].CreatedAt {
+			return facts[i].ID > facts[j].ID
+		}
+		return facts[i].CreatedAt > facts[j].CreatedAt
+	})
+	return facts, nil
+}
+
+func writeFactFile(facts []Fact) error {
+	if err := ensureMemoryStore(); err != nil {
+		return err
+	}
+	var lines []string
+	for _, f := range facts {
+		b, err := json.Marshal(f)
+		if err != nil {
+			return err
+		}
+		lines = append(lines, string(b))
+	}
+	content := strings.Join(lines, "\n")
+	if content != "" {
+		content += "\n"
+	}
+	return os.WriteFile(memoryLessonsPath(), []byte(content), 0o644)
+}
+
+func loadLocalRunNotes(includeArchive bool) ([]localRunNote, error) {
+	if err := ensureMemoryStore(); err != nil {
+		return nil, err
+	}
+	roots := []string{memoryRunsRoot()}
+	if includeArchive {
+		roots = append(roots, memoryArchiveRunsRoot())
+	}
+
+	var notes []localRunNote
+	for _, root := range roots {
+		_ = filepath.WalkDir(root, func(path string, d os.DirEntry, err error) error {
+			if err != nil || d == nil || d.IsDir() || !strings.HasSuffix(path, ".md") {
+				return nil
+			}
+			note, err := parseLocalRunNote(path)
+			if err != nil {
+				return nil
+			}
+			notes = append(notes, note)
+			return nil
+		})
+	}
+
+	sort.Slice(notes, func(i, j int) bool {
+		return notes[i].CreatedAt.After(notes[j].CreatedAt)
+	})
+	return notes, nil
+}
+
+func parseLocalRunNote(path string) (localRunNote, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return localRunNote{}, err
+	}
+	content := string(data)
+	info, err := os.Stat(path)
+	if err != nil {
+		return localRunNote{}, err
+	}
+	note := localRunNote{
+		Path:       path,
+		TopicID:    extractRunMeta(content, "topic"),
+		RunID:      extractRunMeta(content, "run"),
+		Summary:    extractRunSection(content, "Summary"),
+		UserIntent: extractRunSection(content, "User Intent"),
+		CreatedAt:  info.ModTime(),
+	}
+	if rawTime := extractRunMeta(content, "time"); rawTime != "" {
+		if ts, err := time.Parse(time.RFC3339, rawTime); err == nil {
+			note.CreatedAt = ts
+		}
+	}
+	return note, nil
+}
+
+func extractRunMeta(content, key string) string {
+	prefix := "- " + key + ": `"
+	for _, line := range strings.Split(content, "\n") {
+		line = strings.TrimSpace(line)
+		if strings.HasPrefix(line, prefix) && strings.HasSuffix(line, "`") {
+			return strings.TrimSuffix(strings.TrimPrefix(line, prefix), "`")
+		}
+	}
+	return ""
+}
+
+func extractRunSection(content, title string) string {
+	marker := "## " + title + "\n"
+	idx := strings.Index(content, marker)
+	if idx < 0 {
+		return ""
+	}
+	section := content[idx+len(marker):]
+	if next := strings.Index(section, "\n## "); next >= 0 {
+		section = section[:next]
+	}
+	section = strings.TrimSpace(section)
+	if section == "(empty)" {
+		return ""
+	}
+	return section
+}
+
+func SummaryForRunID(runID string) string {
+	notes, err := loadLocalRunNotes(true)
+	if err != nil {
+		return ""
+	}
+	for _, note := range notes {
+		if note.RunID == runID {
+			if note.Summary != "" {
+				return note.Summary
+			}
+			return note.UserIntent
+		}
+	}
+	return ""
+}
+
+func RecentRunSummaries(limit int) []string {
+	notes, err := loadLocalRunNotes(false)
+	if err != nil {
+		return nil
+	}
+	if len(notes) > limit {
+		notes = notes[:limit]
+	}
+	out := make([]string, 0, len(notes))
+	for i := len(notes) - 1; i >= 0; i-- {
+		summary := strings.TrimSpace(notes[i].Summary)
+		if summary == "" {
+			summary = strings.TrimSpace(notes[i].UserIntent)
+		}
+		if summary != "" {
+			out = append(out, summary)
+		}
+	}
+	return out
+}
+
+func RecentMemoryLines(limit int) ([]string, error) {
+	if limit <= 0 {
+		limit = 5
+	}
+	notes, err := loadLocalRunNotes(false)
+	if err != nil {
+		return nil, err
+	}
+	if len(notes) > limit {
+		notes = notes[:limit]
+	}
+	lines := make([]string, 0, len(notes))
+	for _, note := range notes {
+		ts := note.CreatedAt.Format("2006-01-02 15:04")
+		summary := strings.TrimSpace(note.Summary)
+		if summary == "" {
+			summary = strings.TrimSpace(note.UserIntent)
+		}
+		if summary == "" {
+			continue
+		}
+		lines = append(lines, fmt.Sprintf("- [%s] topic=%s run=%s %s", ts, note.TopicID, blankFallback(note.RunID, "-"), summary))
+	}
+	return lines, nil
 }

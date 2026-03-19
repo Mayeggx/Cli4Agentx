@@ -298,7 +298,7 @@ func (r *Registry) registerBuiltins() {
 // RegisterMemoryCommands adds memory-related commands to the registry.
 func RegisterMemoryCommands(r *Registry, db *sql.DB, cfg *Config) {
 	r.Register("memory", `Search or manage memory.
-  memory search <query>              — search local layered memory + DB summaries
+  memory search <query>              — search local layered memory files
   memory search <query> -t <id>      — search within a specific topic
   memory search <query> -k <keyword> — filter results by keyword
   memory recent [n]                  — show the working buffer and recent summaries
@@ -433,38 +433,22 @@ func memoryRecent(db *sql.DB, limit int) (string, error) {
 		return strings.Join(parts, "\n\n"), nil
 	}
 
-	rows, err := db.Query(`SELECT topic_id, COALESCE(run_id, ''), summary, created_at FROM summaries ORDER BY created_at DESC LIMIT ?`, limit*2)
+	lines, err := RecentMemoryLines(remaining)
 	if err != nil {
 		return "", err
 	}
-	defer rows.Close()
-
-	var b strings.Builder
-	shown := 0
-	for rows.Next() {
-		var topicID, runID, summary string
-		var createdAt int64
-		if err := rows.Scan(&topicID, &runID, &summary, &createdAt); err != nil {
-			return "", err
+	if len(lines) > 0 {
+		var extra []string
+		for _, line := range lines {
+			if seen[line] {
+				continue
+			}
+			seen[line] = true
+			extra = append(extra, line)
 		}
-		ts := time.Unix(createdAt, 0).Format("2006-01-02 15:04")
-		line := fmt.Sprintf("- [%s] topic=%s run=%s %s", ts, topicID, blankFallback(runID, "-"), summary)
-		if seen[line] {
-			continue
+		if len(extra) > 0 {
+			parts = append(parts, strings.Join(extra, "\n"))
 		}
-		seen[line] = true
-		b.WriteString(line)
-		b.WriteString("\n")
-		shown++
-		if shown >= remaining {
-			break
-		}
-	}
-	if err := rows.Err(); err != nil {
-		return "", err
-	}
-	if b.Len() > 0 {
-		parts = append(parts, strings.TrimSpace(b.String()))
 	}
 	if len(parts) == 0 {
 		return "No conversation summaries yet.", nil
@@ -669,8 +653,7 @@ func countTopicRuns(db *sql.DB, topicID string) (int, error) {
 func getTopicRunsPage(db *sql.DB, topicID string, limit, offset int) ([]topicRunInfo, error) {
 	query := `
 		SELECT r.id, r.status, r.started_at, COALESCE(r.finished_at, 0),
-			(SELECT COUNT(*) FROM messages m WHERE m.run_id = r.id AND m.role = 'tool'),
-			COALESCE((SELECT s.summary FROM summaries s WHERE s.run_id = r.id LIMIT 1), '')
+			(SELECT COUNT(*) FROM messages m WHERE m.run_id = r.id AND m.role = 'tool')
 		FROM runs r
 		WHERE r.topic_id = ?
 		ORDER BY r.started_at DESC`
@@ -690,9 +673,10 @@ func getTopicRunsPage(db *sql.DB, topicID string, limit, offset int) ([]topicRun
 	var runs []topicRunInfo
 	for rows.Next() {
 		var r topicRunInfo
-		if err := rows.Scan(&r.ID, &r.Status, &r.StartedAt, &r.FinishedAt, &r.ToolCount, &r.Summary); err != nil {
+		if err := rows.Scan(&r.ID, &r.Status, &r.StartedAt, &r.FinishedAt, &r.ToolCount); err != nil {
 			return nil, err
 		}
+		r.Summary = SummaryForRunID(r.ID)
 		runs = append(runs, r)
 	}
 	return runs, rows.Err()
@@ -776,12 +760,12 @@ func getRunInfo(db *sql.DB, runID string) (*topicRunInfo, error) {
 	var r topicRunInfo
 	err := db.QueryRow(`
 		SELECT r.id, r.status, r.started_at, COALESCE(r.finished_at, 0),
-			(SELECT COUNT(*) FROM messages m WHERE m.run_id = r.id AND m.role = 'tool'),
-			COALESCE((SELECT s.summary FROM summaries s WHERE s.run_id = r.id LIMIT 1), '')
+			(SELECT COUNT(*) FROM messages m WHERE m.run_id = r.id AND m.role = 'tool')
 		FROM runs r
-		WHERE r.id = ?`, runID).Scan(&r.ID, &r.Status, &r.StartedAt, &r.FinishedAt, &r.ToolCount, &r.Summary)
+		WHERE r.id = ?`, runID).Scan(&r.ID, &r.Status, &r.StartedAt, &r.FinishedAt, &r.ToolCount)
 	if err != nil {
 		return nil, fmt.Errorf("run %s not found", runID)
 	}
+	r.Summary = SummaryForRunID(runID)
 	return &r, nil
 }

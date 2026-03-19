@@ -3,13 +3,13 @@ package internal
 import (
 	"database/sql"
 	"fmt"
+	"path/filepath"
 	"sort"
 	"strings"
 	"time"
 )
 
-// --- Summary storage ---
-
+// Summary remains for compatibility with topic/run views.
 type Summary struct {
 	ID          int     `json:"id"`
 	TopicID     string  `json:"topic_id"`
@@ -22,273 +22,48 @@ type Summary struct {
 }
 
 func StoreSummary(db *sql.DB, topicID, runID, summary, userMessage string, embedding []float32, embeddingModel string) error {
-	var embBlob []byte
-	if len(embedding) > 0 {
-		embBlob = EncodeEmbedding(embedding)
-	}
-	_, err := db.Exec(`INSERT INTO summaries (topic_id, run_id, summary, user_message, embedding, embedding_model, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)`,
-		topicID, runID, summary, userMessage, embBlob, embeddingModel, time.Now().Unix())
-	return err
+	return SyncLocalMemoryStore(db, topicID, runID, userMessage, summary)
 }
 
 func GetRecentSummaries(db *sql.DB, limit int) ([]string, error) {
-	rows, err := db.Query(`SELECT summary FROM summaries ORDER BY created_at DESC LIMIT ?`, limit)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-
-	var summaries []string
-	for rows.Next() {
-		var s string
-		if err := rows.Scan(&s); err != nil {
-			return nil, err
-		}
-		summaries = append(summaries, s)
-	}
-	for i, j := 0, len(summaries)-1; i < j; i, j = i+1, j-1 {
-		summaries[i], summaries[j] = summaries[j], summaries[i]
-	}
-	return summaries, rows.Err()
+	return RecentRunSummaries(limit), nil
 }
 
-// --- Search with filters ---
-
 type SearchFilter struct {
-	TopicID string // filter by topic
-	Keyword string // keyword filter (applied after semantic/FTS)
+	TopicID string
+	Keyword string
 	Limit   int
 }
 
-// SearchMemory combines semantic + keyword + lightweight lexical search.
 func SearchMemory(db *sql.DB, cfg *Config, query string, filter SearchFilter) ([]Summary, error) {
 	if filter.Limit == 0 {
 		filter.Limit = 5
 	}
-
-	seen := make(map[int]bool)
-	var results []Summary
-	add := func(items []Summary) {
-		for _, item := range items {
-			if seen[item.ID] {
-				continue
-			}
-			seen[item.ID] = true
-			results = append(results, item)
-		}
+	hits, err := SearchAllMemory(db, cfg, query, filter)
+	if err != nil {
+		return nil, err
 	}
-
-	queryEmb, err := GetEmbedding(cfg, query)
-	if err == nil && len(queryEmb) > 0 {
-		if sem, err := searchSemantic(db, queryEmb, filter, 10); err == nil {
-			add(sem)
-		}
+	results := make([]Summary, 0, len(hits))
+	for _, hit := range hits {
+		results = append(results, Summary{
+			TopicID:     extractTopicID(hit),
+			RunID:       extractRunID(hit),
+			SummaryText: hit.Text,
+			Similarity:  float32(minFloat(hit.Score/2.0, 0.99)),
+			CreatedAt:   hit.CreatedAt,
+		})
 	}
-
-	for _, variant := range searchKeywordVariants(query) {
-		if kw, err := searchKeyword(db, variant, filter, 10); err == nil {
-			add(kw)
-		}
-		if len(results) >= filter.Limit*2 {
-			break
-		}
-	}
-
-	if len(results) < filter.Limit {
-		if lexical, err := searchLexical(db, query, filter, 10); err == nil {
-			add(lexical)
-		}
-	}
-
-	if filter.Keyword != "" {
-		kw := strings.ToLower(filter.Keyword)
-		var filtered []Summary
-		for _, r := range results {
-			if strings.Contains(strings.ToLower(r.SummaryText), kw) ||
-				strings.Contains(strings.ToLower(r.UserMessage), kw) {
-				filtered = append(filtered, r)
-			}
-		}
-		results = filtered
-	}
-
-	sort.SliceStable(results, func(i, j int) bool {
-		if results[i].Similarity == results[j].Similarity {
-			return results[i].CreatedAt > results[j].CreatedAt
-		}
-		return results[i].Similarity > results[j].Similarity
-	})
-
-	if len(results) > filter.Limit {
-		results = results[:filter.Limit]
-	}
-
 	enrichTopicNames(db, results)
 	return results, nil
-}
-
-func searchSemantic(db *sql.DB, queryEmbedding []float32, filter SearchFilter, limit int) ([]Summary, error) {
-	query := `SELECT s.id, s.topic_id, COALESCE(s.run_id,''), s.summary, s.user_message, s.embedding, s.created_at
-		FROM summaries s WHERE s.embedding IS NOT NULL`
-	var args []any
-	if filter.TopicID != "" {
-		query += ` AND s.topic_id = ?`
-		args = append(args, filter.TopicID)
-	}
-
-	rows, err := db.Query(query, args...)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-
-	type scored struct {
-		Summary
-		sim float32
-	}
-	var results []scored
-
-	for rows.Next() {
-		var s Summary
-		var embBlob []byte
-		if err := rows.Scan(&s.ID, &s.TopicID, &s.RunID, &s.SummaryText, &s.UserMessage, &embBlob, &s.CreatedAt); err != nil {
-			return nil, err
-		}
-		if len(embBlob) == 0 {
-			continue
-		}
-		sim := CosineSimilarity(queryEmbedding, DecodeEmbedding(embBlob))
-		if sim >= 0.45 {
-			results = append(results, scored{s, sim})
-		}
-	}
-
-	sort.Slice(results, func(i, j int) bool {
-		return results[i].sim > results[j].sim
-	})
-	if len(results) > limit {
-		results = results[:limit]
-	}
-
-	out := make([]Summary, len(results))
-	for i, r := range results {
-		r.Summary.Similarity = r.sim
-		out[i] = r.Summary
-	}
-	return out, rows.Err()
-}
-
-func searchKeyword(db *sql.DB, query string, filter SearchFilter, limit int) ([]Summary, error) {
-	sqlQuery := `SELECT s.id, s.topic_id, COALESCE(s.run_id,''), s.summary, s.user_message, s.created_at
-		FROM summaries_fts fts
-		JOIN summaries s ON s.id = fts.rowid
-		WHERE summaries_fts MATCH ?`
-	args := []any{query}
-	if filter.TopicID != "" {
-		sqlQuery += ` AND s.topic_id = ?`
-		args = append(args, filter.TopicID)
-	}
-	sqlQuery += ` ORDER BY rank LIMIT ?`
-	args = append(args, limit)
-
-	rows, err := db.Query(sqlQuery, args...)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-
-	var results []Summary
-	for rows.Next() {
-		var s Summary
-		if err := rows.Scan(&s.ID, &s.TopicID, &s.RunID, &s.SummaryText, &s.UserMessage, &s.CreatedAt); err != nil {
-			return nil, err
-		}
-		results = append(results, s)
-	}
-	return results, rows.Err()
-}
-
-func searchKeywordVariants(query string) []string {
-	variants := []string{query}
-	for _, term := range expandMemoryTerms(query) {
-		if term == "" {
-			continue
-		}
-		variants = append(variants, term)
-		if len(variants) >= 6 {
-			break
-		}
-	}
-
-	seen := make(map[string]bool)
-	var out []string
-	for _, variant := range variants {
-		variant = strings.TrimSpace(variant)
-		if variant == "" || seen[variant] {
-			continue
-		}
-		seen[variant] = true
-		out = append(out, variant)
-	}
-	return out
-}
-
-func searchLexical(db *sql.DB, query string, filter SearchFilter, limit int) ([]Summary, error) {
-	sqlQuery := `SELECT id, topic_id, COALESCE(run_id,''), summary, user_message, created_at FROM summaries`
-	var args []any
-	if filter.TopicID != "" {
-		sqlQuery += ` WHERE topic_id = ?`
-		args = append(args, filter.TopicID)
-	}
-
-	rows, err := db.Query(sqlQuery, args...)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-
-	type scored struct {
-		Summary
-		score float64
-	}
-	var items []scored
-	for rows.Next() {
-		var s Summary
-		if err := rows.Scan(&s.ID, &s.TopicID, &s.RunID, &s.SummaryText, &s.UserMessage, &s.CreatedAt); err != nil {
-			return nil, err
-		}
-		score := scoreMemoryChunk(query, s.SummaryText+" "+s.UserMessage)
-		if score <= 0 {
-			continue
-		}
-		s.Similarity = float32(minFloat(score/2.0, 0.99))
-		items = append(items, scored{Summary: s, score: score})
-	}
-	if err := rows.Err(); err != nil {
-		return nil, err
-	}
-
-	sort.Slice(items, func(i, j int) bool {
-		if items[i].score == items[j].score {
-			return items[i].CreatedAt > items[j].CreatedAt
-		}
-		return items[i].score > items[j].score
-	})
-	if len(items) > limit {
-		items = items[:limit]
-	}
-
-	out := make([]Summary, len(items))
-	for i, item := range items {
-		out[i] = item.Summary
-	}
-	return out, nil
 }
 
 func enrichTopicNames(db *sql.DB, summaries []Summary) {
 	cache := make(map[string]string)
 	for i := range summaries {
 		tid := summaries[i].TopicID
+		if tid == "" {
+			continue
+		}
 		if name, ok := cache[tid]; ok {
 			summaries[i].TopicName = name
 			continue
@@ -301,14 +76,13 @@ func enrichTopicNames(db *sql.DB, summaries []Summary) {
 	}
 }
 
-// FormatSearchResults renders DB search results with topic + run info.
 func FormatSearchResults(results []Summary) string {
 	if len(results) == 0 {
 		return "No matching memories found."
 	}
 
 	var b strings.Builder
-	fmt.Fprintf(&b, "Found %d DB results:\n", len(results))
+	fmt.Fprintf(&b, "Found %d memory results:\n", len(results))
 	for _, r := range results {
 		ts := time.Unix(r.CreatedAt, 0).Format("01-02 15:04")
 		sim := ""
@@ -337,80 +111,56 @@ func SearchAllMemory(db *sql.DB, cfg *Config, query string, filter SearchFilter)
 		limit = 5
 	}
 
-	var results []MemoryHit
-	if localHits, err := SearchLocalMemory(query, limit*3); err == nil {
-		for _, hit := range localHits {
-			if filter.TopicID != "" && !memoryHitMatchesTopic(hit, filter.TopicID) {
-				continue
-			}
-			if filter.TopicID != "" {
-				hit.Score += 0.5
-			}
-			hit.Score = adjustMemoryHitScore(query, hit)
-			if hit.Score <= 0 {
-				continue
-			}
-			results = append(results, hit)
-		}
+	results, err := SearchLocalMemory(query, limit*4)
+	if err != nil {
+		return nil, err
 	}
-	if dbHits, err := SearchMemory(db, cfg, query, SearchFilter{TopicID: filter.TopicID, Keyword: filter.Keyword, Limit: limit * 2}); err == nil {
-		for _, hit := range dbHits {
-			layer := "DB"
-			if hit.Similarity == 0 {
-				layer = "DB-lexical"
-			}
-			score := float64(hit.Similarity)
-			if filter.TopicID != "" {
-				score += 0.35
-			}
-			memoryHit := MemoryHit{
-				Text:      hit.SummaryText,
-				Source:    fmt.Sprintf("db:topic=%s run=%s", hit.TopicID, blankFallback(hit.RunID, "-")),
-				Layer:     layer,
-				Score:     score,
-				CreatedAt: hit.CreatedAt,
-			}
-			memoryHit.Score = adjustMemoryHitScore(query, memoryHit)
-			if memoryHit.Score <= 0 {
-				continue
-			}
-			results = append(results, memoryHit)
+
+	var filtered []MemoryHit
+	for _, hit := range results {
+		if filter.TopicID != "" && !memoryHitMatchesTopic(hit, filter.TopicID) {
+			continue
 		}
+		hit.Score = adjustMemoryHitScore(query, hit)
+		if hit.Score <= 0 {
+			continue
+		}
+		filtered = append(filtered, hit)
 	}
 
 	if filter.Keyword != "" {
 		kw := strings.ToLower(filter.Keyword)
-		var filtered []MemoryHit
-		for _, hit := range results {
+		var kwFiltered []MemoryHit
+		for _, hit := range filtered {
 			if strings.Contains(strings.ToLower(hit.Text), kw) {
-				filtered = append(filtered, hit)
+				kwFiltered = append(kwFiltered, hit)
 			}
 		}
-		results = filtered
+		filtered = kwFiltered
 	}
 	if !isMetaMemoryQuery(query) {
-		var filtered []MemoryHit
-		for _, hit := range results {
+		var nonMeta []MemoryHit
+		for _, hit := range filtered {
 			if isMetaMemoryText(hit.Text) {
 				continue
 			}
-			filtered = append(filtered, hit)
+			nonMeta = append(nonMeta, hit)
 		}
-		if len(filtered) > 0 {
-			results = filtered
+		if len(nonMeta) > 0 {
+			filtered = nonMeta
 		}
 	}
 
-	sort.SliceStable(results, func(i, j int) bool {
-		if results[i].Score == results[j].Score {
-			return results[i].CreatedAt > results[j].CreatedAt
+	sort.SliceStable(filtered, func(i, j int) bool {
+		if filtered[i].Score == filtered[j].Score {
+			return filtered[i].CreatedAt > filtered[j].CreatedAt
 		}
-		return results[i].Score > results[j].Score
+		return filtered[i].Score > filtered[j].Score
 	})
 
 	seen := make(map[string]bool)
 	var deduped []MemoryHit
-	for _, hit := range results {
+	for _, hit := range filtered {
 		key := hit.Layer + "|" + hit.Text
 		if seen[key] {
 			continue
@@ -428,42 +178,21 @@ func RecallMemories(db *sql.DB, cfg *Config, topicID, query string, limit int) (
 	if limit <= 0 {
 		limit = 3
 	}
-
-	seen := make(map[string]bool)
-	var results []MemoryHit
-	add := func(items []MemoryHit) {
-		for _, item := range items {
-			key := item.Layer + "|" + item.Text
-			if seen[key] {
-				continue
-			}
-			seen[key] = true
-			results = append(results, item)
-			if len(results) >= limit {
-				return
-			}
+	results, err := SearchAllMemory(db, cfg, query, SearchFilter{TopicID: topicID, Limit: limit})
+	if err != nil {
+		return nil, err
+	}
+	var durable []MemoryHit
+	for _, hit := range results {
+		if isDurableRecallLayer(hit.Layer) || hit.Layer == "P2" {
+			durable = append(durable, hit)
+		}
+		if len(durable) >= limit {
+			break
 		}
 	}
-
-	if topicID != "" {
-		if scoped, err := SearchAllMemory(db, cfg, query, SearchFilter{TopicID: topicID, Limit: limit}); err == nil {
-			add(scoped)
-		}
-	}
-	if len(results) < limit {
-		if localHits, err := SearchLocalMemory(query, limit*4); err == nil {
-			var durable []MemoryHit
-			for _, hit := range localHits {
-				if !isDurableRecallLayer(hit.Layer) {
-					continue
-				}
-				durable = append(durable, hit)
-			}
-			add(durable)
-		}
-	}
-	if len(results) > limit {
-		results = results[:limit]
+	if len(durable) > 0 {
+		return durable, nil
 	}
 	return results, nil
 }
@@ -541,13 +270,9 @@ func minFloat(a, b float64) float64 {
 	return b
 }
 
-// --- Legacy compatibility ---
-
 func SearchMemorySemantic(db *sql.DB, queryEmbedding []float32, limit int) ([]Summary, error) {
-	return searchSemantic(db, queryEmbedding, SearchFilter{}, limit)
+	return nil, nil
 }
-
-// --- Summary generation ---
 
 func renderTrajectory(msgs []Message) string {
 	var b strings.Builder
@@ -616,8 +341,6 @@ func GenerateSummary(db *sql.DB, cfg *Config, newMsgs []Message) (string, error)
 	return strings.TrimSpace(resp.Content), nil
 }
 
-// --- Facts ---
-
 type Fact struct {
 	ID        int    `json:"id"`
 	Content   string `json:"content"`
@@ -626,44 +349,51 @@ type Fact struct {
 }
 
 func StoreFact(db *sql.DB, content, category string) error {
+	facts, err := readFactFile()
+	if err != nil {
+		return err
+	}
 	if category == "" {
 		category = "general"
 	}
-	_, err := db.Exec(`INSERT INTO facts (content, category, created_at) VALUES (?, ?, ?)`,
-		content, category, time.Now().Unix())
-	if err != nil {
+	nextID := 1
+	if len(facts) > 0 {
+		nextID = facts[0].ID + 1
+		for _, f := range facts {
+			if f.ID >= nextID {
+				nextID = f.ID + 1
+			}
+		}
+	}
+	facts = append(facts, Fact{ID: nextID, Content: content, Category: category, CreatedAt: time.Now().Unix()})
+	if err := writeFactFile(facts); err != nil {
 		return err
 	}
 	return SyncLocalMemoryStore(db, "", "", content, "")
 }
 
 func ListFacts(db *sql.DB) ([]Fact, error) {
-	rows, err := db.Query(`SELECT id, content, category, created_at FROM facts ORDER BY created_at DESC`)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-
-	var facts []Fact
-	for rows.Next() {
-		var f Fact
-		if err := rows.Scan(&f.ID, &f.Content, &f.Category, &f.CreatedAt); err != nil {
-			return nil, err
-		}
-		facts = append(facts, f)
-	}
-	return facts, rows.Err()
+	return readFactFile()
 }
 
 func DeleteFact(db *sql.DB, id int) error {
-	_, err := db.Exec(`DELETE FROM facts WHERE id = ?`, id)
+	facts, err := readFactFile()
 	if err != nil {
+		return err
+	}
+	filtered := make([]Fact, 0, len(facts))
+	for _, f := range facts {
+		if f.ID == id {
+			continue
+		}
+		filtered = append(filtered, f)
+	}
+	if err := writeFactFile(filtered); err != nil {
 		return err
 	}
 	return SyncLocalMemoryStore(db, "", "", "", "")
 }
 
-// ProcessMemory generates summary and embedding for a completed Run.
 func ProcessMemory(db *sql.DB, cfg *Config, topicID, runID string, newMsgs []Message) {
 	var userMessage string
 	for _, m := range newMsgs {
@@ -674,14 +404,54 @@ func ProcessMemory(db *sql.DB, cfg *Config, topicID, runID string, newMsgs []Mes
 	}
 
 	summary, _ := GenerateSummary(db, cfg, newMsgs)
-	if summary == "" {
-		_ = SyncLocalMemoryStore(db, topicID, runID, userMessage, "")
+	if err := SyncLocalMemoryStore(db, topicID, runID, userMessage, summary); err != nil {
 		return
 	}
+}
 
-	embedding, _ := GetEmbedding(cfg, summary)
-	if err := StoreSummary(db, topicID, runID, summary, userMessage, embedding, cfg.EmbeddingModel); err != nil {
-		return
+func extractTopicID(hit MemoryHit) string {
+	if idx := strings.Index(hit.Text, "topic="); idx >= 0 {
+		rest := hit.Text[idx+len("topic="):]
+		return firstToken(rest)
 	}
-	_ = SyncLocalMemoryStore(db, topicID, runID, userMessage, summary)
+	if idx := strings.Index(hit.Source, "topic="); idx >= 0 {
+		rest := hit.Source[idx+len("topic="):]
+		return firstToken(rest)
+	}
+	parts := strings.Split(filepathToSlash(hit.Source), "/")
+	for i, part := range parts {
+		if part == "runs" && i+2 < len(parts) {
+			name := parts[len(parts)-1]
+			segments := strings.Split(strings.TrimSuffix(name, ".md"), "_")
+			if len(segments) >= 3 {
+				return segments[1]
+			}
+		}
+	}
+	return ""
+}
+
+func extractRunID(hit MemoryHit) string {
+	if idx := strings.Index(hit.Text, "run="); idx >= 0 {
+		rest := hit.Text[idx+len("run="):]
+		return firstToken(rest)
+	}
+	parts := strings.Split(filepath.Base(hit.Source), "_")
+	if len(parts) >= 3 {
+		return strings.TrimSuffix(parts[2], ".md")
+	}
+	return ""
+}
+
+func firstToken(s string) string {
+	for i, r := range s {
+		if r == ' ' || r == ']' || r == '`' {
+			return s[:i]
+		}
+	}
+	return s
+}
+
+func filepathToSlash(path string) string {
+	return strings.ReplaceAll(path, "\\", "/")
 }
