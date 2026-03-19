@@ -85,7 +85,7 @@ func BuildContext(db *sql.DB, cfg *Config, topicID, userMessage string) (*Contex
 	var messages []Message
 
 	if len(completedRuns) == 0 {
-		messages = append(messages, wrapUserMessage(cfg, db, userMessage))
+		messages = append(messages, wrapUserMessage(cfg, db, topicID, userMessage))
 		return &ContextResult{SystemPrompt: systemPrompt, Messages: messages}, nil
 	}
 
@@ -113,17 +113,17 @@ func BuildContext(db *sql.DB, cfg *Config, topicID, userMessage string) (*Contex
 		messages = append(messages, runMsgs...)
 	}
 
-	messages = append(messages, wrapUserMessage(cfg, db, userMessage))
+	messages = append(messages, wrapUserMessage(cfg, db, topicID, userMessage))
 
 	return &ContextResult{SystemPrompt: systemPrompt, Messages: messages}, nil
 }
 
-func wrapUserMessage(cfg *Config, db *sql.DB, userMessage string) Message {
+func wrapUserMessage(cfg *Config, db *sql.DB, topicID, userMessage string) Message {
 	var b strings.Builder
 
 	fmt.Fprintf(&b, "<user>\n%s\n</user>", userMessage)
 
-	recall := buildRecall(db, cfg, userMessage)
+	recall := buildRecall(db, cfg, topicID, userMessage)
 	if recall != "" {
 		fmt.Fprintf(&b, "\n\n<recall>\n%s</recall>", recall)
 	}
@@ -136,21 +136,19 @@ func wrapUserMessage(cfg *Config, db *sql.DB, userMessage string) Message {
 	return TextMessage("user", b.String())
 }
 
-func buildRecall(db *sql.DB, cfg *Config, userMessage string) string {
-	queryEmb, err := GetEmbedding(cfg, userMessage)
-	if err != nil || len(queryEmb) == 0 {
-		return ""
-	}
-
-	results, err := SearchMemorySemantic(db, queryEmb, 3)
+func buildRecall(db *sql.DB, cfg *Config, topicID, userMessage string) string {
+	results, err := RecallMemories(db, cfg, topicID, userMessage, 3)
 	if err != nil || len(results) == 0 {
 		return ""
 	}
 
 	var b strings.Builder
 	for _, r := range results {
-		ts := time.Unix(r.CreatedAt, 0).Format("01-02 15:04")
-		fmt.Fprintf(&b, "- [%s] (%.0f%%) %s\n", ts, r.Similarity*100, r.SummaryText)
+		ts := "-"
+		if r.CreatedAt > 0 {
+			ts = time.Unix(r.CreatedAt, 0).Format("01-02 15:04")
+		}
+		fmt.Fprintf(&b, "- [%s] [%s] %s\n", ts, r.Layer, r.Text)
 	}
 	return b.String()
 }

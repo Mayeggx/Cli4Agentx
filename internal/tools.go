@@ -298,16 +298,17 @@ func (r *Registry) registerBuiltins() {
 // RegisterMemoryCommands adds memory-related commands to the registry.
 func RegisterMemoryCommands(r *Registry, db *sql.DB, cfg *Config) {
 	r.Register("memory", `Search or manage memory.
-  memory search <query>              — search across all topics (semantic + keyword)
+  memory search <query>              — search local layered memory + DB summaries
   memory search <query> -t <id>      — search within a specific topic
   memory search <query> -k <keyword> — filter results by keyword
-  memory recent [n]                  — show recent conversation summaries
+  memory recent [n]                  — show the working buffer and recent summaries
+  memory compact [days]              — archive older run notes, keep recent days hot
   memory store <note>                — store a fact/note
   memory facts                       — list all stored facts
   memory forget <id>                 — delete a fact by ID`,
 		func(args []string, stdin string) (string, error) {
 			if len(args) == 0 {
-				return "", fmt.Errorf("usage: memory search|recent|store|facts|forget")
+				return "", fmt.Errorf("usage: memory search|recent|compact|store|facts|forget")
 			}
 
 			switch args[0] {
@@ -325,6 +326,17 @@ func RegisterMemoryCommands(r *Registry, db *sql.DB, cfg *Config) {
 					}
 				}
 				return memoryRecent(db, limit)
+
+			case "compact":
+				keepDays := localMemoryHotRunDays
+				if len(args) > 1 {
+					n, err := strconv.Atoi(args[1])
+					if err != nil {
+						return "", fmt.Errorf("invalid days: %s", args[1])
+					}
+					keepDays = n
+				}
+				return CompactLocalMemoryStore(db, keepDays)
 
 			case "store":
 				if len(args) < 2 && stdin == "" {
@@ -356,7 +368,7 @@ func RegisterMemoryCommands(r *Registry, db *sql.DB, cfg *Config) {
 				return fmt.Sprintf("fact %d deleted", id), nil
 
 			default:
-				return "", fmt.Errorf("unknown: memory %s. Use: search|recent|store|facts|forget", args[0])
+				return "", fmt.Errorf("unknown: memory %s. Use: search|recent|compact|store|facts|forget", args[0])
 			}
 		})
 }
@@ -387,33 +399,97 @@ func memorySearchCmd(db *sql.DB, cfg *Config, args []string) (string, error) {
 		return "", fmt.Errorf("query is required")
 	}
 
-	results, err := SearchMemory(db, cfg, query, filter)
+	results, err := SearchAllMemory(db, cfg, query, filter)
 	if err != nil {
 		return "", err
 	}
 
-	return FormatSearchResults(results), nil
+	return FormatMemoryHits(results), nil
 }
 
 func memoryRecent(db *sql.DB, limit int) (string, error) {
-	rows, err := db.Query(`SELECT summary, created_at FROM summaries ORDER BY created_at DESC LIMIT ?`, limit)
+	if limit <= 0 {
+		limit = 5
+	}
+
+	var parts []string
+	seen := make(map[string]bool)
+	remaining := limit
+
+	if sessionState, err := ReadLocalMemoryFile("SESSION-STATE.md"); err == nil && sessionState != "" {
+		trimmed, used := trimSessionState(sessionState, remaining)
+		if trimmed != "" {
+			parts = append(parts, trimmed)
+			remaining -= used
+			for _, line := range strings.Split(trimmed, "\n") {
+				line = strings.TrimSpace(line)
+				if strings.HasPrefix(line, "- [") {
+					seen[line] = true
+				}
+			}
+		}
+	}
+	if remaining <= 0 {
+		return strings.Join(parts, "\n\n"), nil
+	}
+
+	rows, err := db.Query(`SELECT topic_id, COALESCE(run_id, ''), summary, created_at FROM summaries ORDER BY created_at DESC LIMIT ?`, limit*2)
 	if err != nil {
 		return "", err
 	}
 	defer rows.Close()
 
 	var b strings.Builder
+	shown := 0
 	for rows.Next() {
-		var summary string
+		var topicID, runID, summary string
 		var createdAt int64
-		rows.Scan(&summary, &createdAt)
+		if err := rows.Scan(&topicID, &runID, &summary, &createdAt); err != nil {
+			return "", err
+		}
 		ts := time.Unix(createdAt, 0).Format("2006-01-02 15:04")
-		fmt.Fprintf(&b, "[%s] %s\n", ts, summary)
+		line := fmt.Sprintf("- [%s] topic=%s run=%s %s", ts, topicID, blankFallback(runID, "-"), summary)
+		if seen[line] {
+			continue
+		}
+		seen[line] = true
+		b.WriteString(line)
+		b.WriteString("\n")
+		shown++
+		if shown >= remaining {
+			break
+		}
 	}
-	if b.Len() == 0 {
+	if err := rows.Err(); err != nil {
+		return "", err
+	}
+	if b.Len() > 0 {
+		parts = append(parts, strings.TrimSpace(b.String()))
+	}
+	if len(parts) == 0 {
 		return "No conversation summaries yet.", nil
 	}
-	return b.String(), nil
+	return strings.Join(parts, "\n\n"), nil
+}
+
+func trimSessionState(content string, limit int) (string, int) {
+	if limit <= 0 {
+		return "", 0
+	}
+	lines := strings.Split(strings.TrimSpace(content), "\n")
+	var out []string
+	used := 0
+	for _, line := range lines {
+		trimmed := strings.TrimSpace(line)
+		if strings.HasPrefix(trimmed, "- [") {
+			if used >= limit {
+				continue
+			}
+			used++
+		}
+		out = append(out, line)
+	}
+	return strings.Join(out, "\n"), used
 }
 
 func memoryFacts(db *sql.DB) (string, error) {

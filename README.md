@@ -43,6 +43,7 @@ run(command="write report.md" stdin="# 报告内容...")
 - **Facts**：手动存储的持久化事实（`memory store`）
 - **Summaries**：每次 Run 结束后由 LLM 自动生成摘要 + 向量嵌入
 - **语义搜索**：新消息自动召回相关历史摘要（余弦相似度 > 0.5）
+- **本地压缩**：`memory compact [days]` 将旧的 `runs/` 笔记移入 `data/memory/archive/`，只保留近期热数据
 
 **4. LLM 调用全量日志**
 
@@ -217,7 +218,7 @@ LLM 可以通过 `run` 工具调用以下命令：
 |------|------|------|
 | **文件** | `ls`, `cat`, `write`, `stat`, `rm`, `cp`, `mv`, `mkdir` | 文件 I/O，路径限定在话题目录内 |
 | **文本** | `grep`, `head`, `tail`, `wc`, `echo` | 文本处理工具 |
-| **记忆** | `memory search/recent/store/facts/forget` | 语义搜索 + 持久化事实 |
+| **记忆** | `memory search/recent/compact/store/facts/forget` | 语义搜索 + 持久化事实 + 本地记忆压缩 |
 | **话题** | `topic list/info/runs/run/rename/search` | 会话管理 |
 | **Skill** | `skill list/load/search/create/update/delete` | 可复用操作指南 |
 | **配置** | `config set/delete` | 运行时修改配置 |
@@ -234,6 +235,9 @@ run(command="cat data.txt | grep error | wc -l")
 
 # ; 顺序执行
 run(command="write a.txt hello ; write b.txt world")
+
+# 压缩本地记忆，只保留最近 7 天热数据
+run(command="memory compact 7")
 ```
 
 ---
