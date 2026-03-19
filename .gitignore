@@ -1,0 +1,23 @@
+# OS and editor files
+.DS_Store
+.idea/
+.vscode/
+
+# Build outputs
+agent
+bin/
+dist/
+*.exe
+*.out
+*.test
+*.prof
+coverage.out
+
+# Runtime data
+/data/
+/logs/
+
+# Local environment overrides
+.env
+.env.*
+!.env.example
