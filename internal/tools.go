@@ -509,6 +509,8 @@ func RegisterTopicCommands(r *Registry, db *sql.DB, cfg *Config) {
   topic info <id>                  — show topic details and run history
   topic runs <id> [limit]          — list runs (default: 10, newest first)
   topic run <run-id>               — show a run's full messages
+  topic tree <id>                  — show the run branch tree for a topic
+  topic checkout <id> <node-id>    — switch the topic leaf to a previous node
   topic rename <id> <new-name>     — rename a topic
   topic search <id> <query>        — search within a topic`,
 		func(args []string, stdin string) (string, error) {
@@ -542,6 +544,21 @@ func RegisterTopicCommands(r *Registry, db *sql.DB, cfg *Config) {
 				}
 				return fmt.Sprintf("topic %s renamed to %q", args[1], newName), nil
 
+			case "tree":
+				if len(args) < 2 {
+					return "", fmt.Errorf("usage: topic tree <id>")
+				}
+				return topicTree(db, args[1])
+
+			case "checkout":
+				if len(args) < 3 {
+					return "", fmt.Errorf("usage: topic checkout <id> <node-id>")
+				}
+				if err := CheckoutTopicNode(db, args[1], args[2]); err != nil {
+					return "", err
+				}
+				return fmt.Sprintf("topic %s checked out to node %s", args[1], args[2]), nil
+
 			case "runs":
 				if len(args) < 2 {
 					return "", fmt.Errorf("usage: topic runs <id> [limit]")
@@ -573,7 +590,7 @@ func RegisterTopicCommands(r *Registry, db *sql.DB, cfg *Config) {
 				return FormatSearchResults(results), nil
 
 			default:
-				return "", fmt.Errorf("unknown: topic %s. Use: list|info|runs|run|search|rename", args[0])
+				return "", fmt.Errorf("unknown: topic %s. Use: list|info|runs|run|tree|checkout|search|rename", args[0])
 			}
 		})
 }
@@ -680,6 +697,44 @@ func getTopicRunsPage(db *sql.DB, topicID string, limit, offset int) ([]topicRun
 		runs = append(runs, r)
 	}
 	return runs, rows.Err()
+}
+
+func topicTree(db *sql.DB, topicID string) (string, error) {
+	nodes, err := ListSessionNodes(db, topicID)
+	if err != nil {
+		return "", err
+	}
+	if len(nodes) == 0 {
+		return "No branch nodes in this topic yet.", nil
+	}
+	leafID, _ := GetTopicLeafNodeID(db, topicID)
+	children := make(map[string][]SessionNode)
+	for _, node := range nodes {
+		children[node.ParentID] = append(children[node.ParentID], node)
+	}
+
+	var b strings.Builder
+	b.WriteString("Topic tree:\n")
+	var walk func(parentID, prefix string)
+	walk = func(parentID, prefix string) {
+		for _, node := range children[parentID] {
+			marker := "  "
+			if node.ID == leafID {
+				marker = "* "
+			}
+			label := node.Summary
+			if label == "" {
+				label = SummaryForRunID(node.RunID)
+			}
+			if label == "" {
+				label = "(summary pending)"
+			}
+			fmt.Fprintf(&b, "%s%s%s  run=%s  %s\n", prefix, marker, node.ID, node.RunID, truncate(label, 80))
+			walk(node.ID, prefix+"  ")
+		}
+	}
+	walk("", "")
+	return strings.TrimRight(b.String(), "\n"), nil
 }
 
 func topicRuns(db *sql.DB, topicID string, limit int) (string, error) {

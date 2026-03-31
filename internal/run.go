@@ -12,23 +12,25 @@ import (
 )
 
 type Run struct {
-	ID         string `json:"id"`
-	TopicID    string `json:"topic_id"`
-	Status     string `json:"status"`
-	PID        int    `json:"pid"`
-	Async      bool   `json:"async"`
-	StartedAt  int64  `json:"started_at"`
-	FinishedAt *int64 `json:"finished_at,omitempty"`
+	ID           string `json:"id"`
+	TopicID      string `json:"topic_id"`
+	ParentNodeID string `json:"parent_node_id,omitempty"`
+	Status       string `json:"status"`
+	PID          int    `json:"pid"`
+	Async        bool   `json:"async"`
+	StartedAt    int64  `json:"started_at"`
+	FinishedAt   *int64 `json:"finished_at,omitempty"`
 }
 
-func CreateRun(db *sql.DB, topicID string, pid int, async bool) (*Run, error) {
+func CreateRun(db *sql.DB, topicID, parentNodeID string, pid int, async bool) (*Run, error) {
 	r := &Run{
-		ID:        uuid.NewString()[:8],
-		TopicID:   topicID,
-		Status:    "running",
-		PID:       pid,
-		Async:     async,
-		StartedAt: time.Now().Unix(),
+		ID:           uuid.NewString()[:8],
+		TopicID:      topicID,
+		ParentNodeID: parentNodeID,
+		Status:       "running",
+		PID:          pid,
+		Async:        async,
+		StartedAt:    time.Now().Unix(),
 	}
 
 	asyncInt := 0
@@ -36,8 +38,8 @@ func CreateRun(db *sql.DB, topicID string, pid int, async bool) (*Run, error) {
 		asyncInt = 1
 	}
 
-	_, err := db.Exec(`INSERT INTO runs (id, topic_id, status, pid, async, started_at) VALUES (?, ?, ?, ?, ?, ?)`,
-		r.ID, r.TopicID, r.Status, r.PID, asyncInt, r.StartedAt)
+	_, err := db.Exec(`INSERT INTO runs (id, topic_id, parent_node_id, status, pid, async, started_at) VALUES (?, ?, ?, ?, ?, ?, ?)`,
+		r.ID, r.TopicID, nullableString(r.ParentNodeID), r.Status, r.PID, asyncInt, r.StartedAt)
 	if err != nil {
 		return nil, fmt.Errorf("insert run: %w", err)
 	}
@@ -52,7 +54,7 @@ func CreateRun(db *sql.DB, topicID string, pid int, async bool) (*Run, error) {
 }
 
 func GetActiveRun(db *sql.DB, topicID string) (*Run, error) {
-	r, err := scanRun(db.QueryRow(`SELECT id, topic_id, status, pid, async, started_at, finished_at FROM runs WHERE topic_id = ? AND status = 'running'`, topicID))
+	r, err := scanRun(db.QueryRow(`SELECT id, topic_id, COALESCE(parent_node_id, ''), status, pid, async, started_at, finished_at FROM runs WHERE topic_id = ? AND status = 'running'`, topicID))
 	if err == sql.ErrNoRows {
 		return nil, nil
 	}
@@ -91,7 +93,7 @@ func GetActiveRunTopics(db *sql.DB) map[string]bool {
 }
 
 func GetRun(db *sql.DB, runID string) (*Run, error) {
-	r, err := scanRun(db.QueryRow(`SELECT id, topic_id, status, pid, async, started_at, finished_at FROM runs WHERE id = ?`, runID))
+	r, err := scanRun(db.QueryRow(`SELECT id, topic_id, COALESCE(parent_node_id, ''), status, pid, async, started_at, finished_at FROM runs WHERE id = ?`, runID))
 	if err == sql.ErrNoRows {
 		return nil, fmt.Errorf("run %s not found", runID)
 	}
@@ -232,7 +234,7 @@ func scanRun(row *sql.Row) (*Run, error) {
 	var r Run
 	var asyncInt int
 	var finishedAt sql.NullInt64
-	err := row.Scan(&r.ID, &r.TopicID, &r.Status, &r.PID, &asyncInt, &r.StartedAt, &finishedAt)
+	err := row.Scan(&r.ID, &r.TopicID, &r.ParentNodeID, &r.Status, &r.PID, &asyncInt, &r.StartedAt, &finishedAt)
 	if err != nil {
 		return nil, err
 	}

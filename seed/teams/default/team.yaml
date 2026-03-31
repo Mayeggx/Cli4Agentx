@@ -1,0 +1,41 @@
+name: default
+description: >
+  A safe multi-role workflow that plans, researches, executes, and validates in sequence.
+
+shared_prompt_file: shared.md
+
+roles:
+  - name: planner
+    description: Break the task down into an actionable plan.
+    prompt_file: roles/planner.md
+    artifact: plan.md
+
+  - name: researcher-codebase
+    description: Gather implementation context from the codebase and existing materials.
+    prompt_file: roles/researcher.md
+    artifact: research-codebase.md
+    depends_on:
+      - planner
+
+  - name: researcher-risks
+    description: Gather risks, edge cases, and verification concerns in parallel.
+    prompt_file: roles/researcher-risks.md
+    artifact: research-risks.md
+    depends_on:
+      - planner
+
+  - name: implementer
+    description: Produce the main deliverable using the plan and research.
+    prompt_file: roles/implementer.md
+    artifact: implementation.md
+    depends_on:
+      - planner
+      - researcher-codebase
+      - researcher-risks
+
+  - name: tester
+    description: Verify the work, document risks, and call out gaps.
+    prompt_file: roles/tester.md
+    artifact: test-report.md
+    depends_on:
+      - implementer

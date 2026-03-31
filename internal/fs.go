@@ -3,6 +3,7 @@ package internal
 import (
 	"encoding/base64"
 	"fmt"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"strings"
@@ -74,6 +75,58 @@ func resolvePathToRelative(path string) string {
 	return path
 }
 
+func isProtectedResolvedRoot(abs string) bool {
+	abs = filepath.Clean(abs)
+	topicsRoot := filepath.Join(dataRoot(), "topics")
+	if abs == topicsRoot {
+		return true
+	}
+	if currentTopicID := getCurrentTopic(); currentTopicID != "" {
+		if abs == filepath.Clean(TopicDir(currentTopicID)) {
+			return true
+		}
+	}
+	return false
+}
+
+func ensureWritablePath(raw, abs string) error {
+	if isProtectedResolvedRoot(abs) {
+		return fmt.Errorf("refuse to write to protected root path: %s", raw)
+	}
+	return nil
+}
+
+func ensureRemovablePath(raw, abs string) error {
+	if isProtectedResolvedRoot(abs) {
+		return fmt.Errorf("refuse to remove protected root path: %s", raw)
+	}
+	return nil
+}
+
+func repoRoot() (string, error) {
+	root, err := os.Getwd()
+	if err != nil {
+		return "", fmt.Errorf("get repo root: %w", err)
+	}
+	return filepath.Clean(root), nil
+}
+
+func resolveRepoPath(rel string) (string, error) {
+	root, err := repoRoot()
+	if err != nil {
+		return "", err
+	}
+	if strings.TrimSpace(rel) == "" {
+		return root, nil
+	}
+	abs := filepath.Join(root, rel)
+	abs = filepath.Clean(abs)
+	if !strings.HasPrefix(abs, root+string(os.PathSeparator)) && abs != root {
+		return "", fmt.Errorf("path escapes repo root: %s", rel)
+	}
+	return abs, nil
+}
+
 // localDataURLPrefix is the URL scheme for referencing local data files.
 const localDataURLPrefix = "local-data://data/"
 
@@ -98,6 +151,9 @@ func RegisterFSCommands(r *Registry) {
 	r.Register("cp", "Copy file. Usage: cp <src> <dst>", fsCp)
 	r.Register("mv", "Move/rename file. Usage: mv <src> <dst>", fsMv)
 	r.Register("mkdir", "Create directory. Usage: mkdir <dir>", fsMkdir)
+	r.Register("repo-ls", "List files from repo root (read-only). Usage: repo-ls [dir]", repoLs)
+	r.Register("repo-cat", "Read a repo file (read-only). Usage: repo-cat <path>", repoCat)
+	r.Register("repo-grep", "Search repo text recursively (read-only). Usage: repo-grep [-i] <pattern> [dir]", repoGrep)
 }
 
 func fsLs(args []string, stdin string) (string, error) {
@@ -213,6 +269,9 @@ func fsWrite(args []string, stdin string) (string, error) {
 		return "", err
 	}
 
+	if err := ensureWritablePath(path, abs); err != nil {
+		return "", err
+	}
 	if err := os.MkdirAll(filepath.Dir(abs), 0o755); err != nil {
 		return "", fmt.Errorf("mkdir: %w", err)
 	}
@@ -304,6 +363,9 @@ func fsRm(args []string, stdin string) (string, error) {
 		return "", err
 	}
 
+	if err := ensureRemovablePath(args[0], abs); err != nil {
+		return "", err
+	}
 	if err := os.RemoveAll(abs); err != nil {
 		return "", fmt.Errorf("rm: %w", err)
 	}
@@ -324,6 +386,12 @@ func fsCp(args []string, stdin string) (string, error) {
 		return "", err
 	}
 
+	if err := ensureRemovablePath(args[0], srcAbs); err != nil {
+		return "", err
+	}
+	if err := ensureWritablePath(args[1], dstAbs); err != nil {
+		return "", err
+	}
 	data, err := os.ReadFile(srcAbs)
 	if err != nil {
 		return "", fmt.Errorf("cp read: %w", err)
@@ -353,6 +421,12 @@ func fsMv(args []string, stdin string) (string, error) {
 		return "", err
 	}
 
+	if err := ensureRemovablePath(args[0], srcAbs); err != nil {
+		return "", err
+	}
+	if err := ensureWritablePath(args[1], dstAbs); err != nil {
+		return "", err
+	}
 	if err := os.MkdirAll(filepath.Dir(dstAbs), 0o755); err != nil {
 		return "", fmt.Errorf("mv mkdir: %w", err)
 	}
@@ -373,8 +447,170 @@ func fsMkdir(args []string, stdin string) (string, error) {
 		return "", err
 	}
 
+	if err := ensureWritablePath(args[0], abs); err != nil {
+		return "", err
+	}
 	if err := os.MkdirAll(abs, 0o755); err != nil {
 		return "", fmt.Errorf("mkdir: %w", err)
 	}
 	return fmt.Sprintf("Created %s", args[0]), nil
+}
+
+func repoLs(args []string, stdin string) (string, error) {
+	dir := ""
+	if len(args) > 0 {
+		dir = args[0]
+	}
+	abs, err := resolveRepoPath(dir)
+	if err != nil {
+		return "", err
+	}
+	entries, err := os.ReadDir(abs)
+	if err != nil {
+		return "", fmt.Errorf("repo-ls: %w", err)
+	}
+
+	var out strings.Builder
+	for _, e := range entries {
+		info, _ := e.Info()
+		if e.IsDir() {
+			fmt.Fprintf(&out, "d  %-8s %s/\n", "-", e.Name())
+		} else if info != nil {
+			fmt.Fprintf(&out, "f  %-8s %s\n", humanSize(info.Size()), e.Name())
+		} else {
+			fmt.Fprintf(&out, "f  %-8s %s\n", "?", e.Name())
+		}
+	}
+	if out.Len() == 0 {
+		return "(empty directory)", nil
+	}
+	return strings.TrimRight(out.String(), "\n"), nil
+}
+
+func repoCat(args []string, stdin string) (string, error) {
+	if len(args) == 0 {
+		return "", fmt.Errorf("usage: repo-cat <path>")
+	}
+	abs, err := resolveRepoPath(args[0])
+	if err != nil {
+		return "", err
+	}
+	info, err := os.Stat(abs)
+	if err != nil {
+		return "", fmt.Errorf("repo-cat: %w", err)
+	}
+	if info.IsDir() {
+		return "", fmt.Errorf("repo-cat: %s is a directory", args[0])
+	}
+	data, err := os.ReadFile(abs)
+	if err != nil {
+		return "", fmt.Errorf("repo-cat: %w", err)
+	}
+	if looksLikeBinary(string(data)) {
+		return "", fmt.Errorf("repo-cat: binary file not supported")
+	}
+	return string(data), nil
+}
+
+func repoGrep(args []string, stdin string) (string, error) {
+	if len(args) == 0 {
+		return "", fmt.Errorf("usage: repo-grep [-i] <pattern> [dir]")
+	}
+	ignoreCase := false
+	var pattern string
+	searchRoot := ""
+	for _, a := range args {
+		if a == "-i" {
+			ignoreCase = true
+			continue
+		}
+		if pattern == "" {
+			pattern = a
+			continue
+		}
+		if searchRoot == "" {
+			searchRoot = a
+			continue
+		}
+	}
+	if pattern == "" {
+		return "", fmt.Errorf("usage: repo-grep [-i] <pattern> [dir]")
+	}
+	abs, err := resolveRepoPath(searchRoot)
+	if err != nil {
+		return "", err
+	}
+
+	needle := pattern
+	if ignoreCase {
+		needle = strings.ToLower(pattern)
+	}
+	var matches []string
+	const maxMatches = 200
+	root, err := repoRoot()
+	if err != nil {
+		return "", err
+	}
+	searchFile := func(path string, d fs.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return nil
+		}
+		if d.IsDir() {
+			name := d.Name()
+			rel, _ := filepath.Rel(root, path)
+			rel = filepath.ToSlash(rel)
+			switch name {
+			case ".git", "node_modules":
+				return filepath.SkipDir
+			}
+			if rel == "data/topics" || rel == "data/runs" || rel == "logs" {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		data, err := os.ReadFile(path)
+		if err != nil {
+			return nil
+		}
+		text := string(data)
+		if looksLikeBinary(text) {
+			return nil
+		}
+		lines := strings.Split(text, "\n")
+		rel, _ := filepath.Rel(root, path)
+		rel = filepath.ToSlash(rel)
+		for i, line := range lines {
+			haystack := line
+			if ignoreCase {
+				haystack = strings.ToLower(line)
+			}
+			if strings.Contains(haystack, needle) {
+				matches = append(matches, fmt.Sprintf("%s:%d:%s", rel, i+1, line))
+				if len(matches) >= maxMatches {
+					return fs.SkipAll
+				}
+			}
+		}
+		return nil
+	}
+
+	info, err := os.Stat(abs)
+	if err != nil {
+		return "", fmt.Errorf("repo-grep: %w", err)
+	}
+	if info.IsDir() {
+		err = filepath.WalkDir(abs, searchFile)
+		if err != nil && err != fs.SkipAll {
+			return "", fmt.Errorf("repo-grep: %w", err)
+		}
+	} else {
+		d := fs.FileInfoToDirEntry(info)
+		if err := searchFile(abs, d, nil); err != nil && err != fs.SkipAll {
+			return "", fmt.Errorf("repo-grep: %w", err)
+		}
+	}
+	if len(matches) == 0 {
+		return "no matches", nil
+	}
+	return strings.Join(matches, "\n"), nil
 }

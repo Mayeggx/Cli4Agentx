@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"time"
 
@@ -51,11 +52,33 @@ func OpenDB() (*sql.DB, error) {
 		"ALTER TABLE events ADD COLUMN timezone TEXT NOT NULL DEFAULT 'Local'",
 		"ALTER TABLE events ADD COLUMN last_run_at INTEGER",
 		"ALTER TABLE events ADD COLUMN canceled_at INTEGER",
+		"ALTER TABLE topics ADD COLUMN leaf_node_id TEXT",
+		"ALTER TABLE runs ADD COLUMN parent_node_id TEXT",
 	} {
 		if _, err := db.Exec(stmt); err != nil && !strings.Contains(err.Error(), "duplicate column name") {
 			_ = db.Close()
 			return nil, fmt.Errorf("migrate schema: %w", err)
 		}
+	}
+
+	if _, err := db.Exec(`CREATE TABLE IF NOT EXISTS session_nodes (
+		id TEXT PRIMARY KEY,
+		topic_id TEXT NOT NULL REFERENCES topics(id),
+		parent_id TEXT,
+		run_id TEXT NOT NULL REFERENCES runs(id),
+		summary TEXT NOT NULL DEFAULT '',
+		created_at INTEGER NOT NULL
+	)`); err != nil {
+		_ = db.Close()
+		return nil, fmt.Errorf("init session_nodes: %w", err)
+	}
+	if _, err := db.Exec(`CREATE INDEX IF NOT EXISTS idx_session_nodes_topic_created ON session_nodes(topic_id, created_at)`); err != nil {
+		_ = db.Close()
+		return nil, fmt.Errorf("init session_nodes index: %w", err)
+	}
+	if _, err := db.Exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_session_nodes_run ON session_nodes(run_id)`); err != nil {
+		_ = db.Close()
+		return nil, fmt.Errorf("init session_nodes run index: %w", err)
 	}
 
 	// one-time data cleanup: move <think> from content to reasoning
@@ -105,8 +128,18 @@ func migrateThinkTags(db *sql.DB) {
 // --- Topics ---
 
 type Topic struct {
+	ID         string `json:"id"`
+	Name       string `json:"name"`
+	CreatedAt  int64  `json:"created_at"`
+	LeafNodeID string `json:"leaf_node_id,omitempty"`
+}
+
+type SessionNode struct {
 	ID        string `json:"id"`
-	Name      string `json:"name"`
+	TopicID   string `json:"topic_id"`
+	ParentID  string `json:"parent_id,omitempty"`
+	RunID     string `json:"run_id"`
+	Summary   string `json:"summary,omitempty"`
 	CreatedAt int64  `json:"created_at"`
 }
 
@@ -116,7 +149,7 @@ func CreateTopic(db *sql.DB, name string) (*Topic, error) {
 		Name:      name,
 		CreatedAt: time.Now().Unix(),
 	}
-	_, err := db.Exec("INSERT INTO topics (id, name, created_at) VALUES (?, ?, ?)",
+	_, err := db.Exec("INSERT INTO topics (id, name, created_at, leaf_node_id) VALUES (?, ?, ?, '')",
 		t.ID, t.Name, t.CreatedAt)
 	if err != nil {
 		return nil, fmt.Errorf("insert topic: %w", err)
@@ -192,7 +225,7 @@ func RenameTopic(db *sql.DB, id, name string) error {
 
 func GetTopic(db *sql.DB, id string) (*Topic, error) {
 	var t Topic
-	err := db.QueryRow("SELECT id, name, created_at FROM topics WHERE id = ?", id).Scan(&t.ID, &t.Name, &t.CreatedAt)
+	err := db.QueryRow("SELECT id, name, created_at, COALESCE(leaf_node_id, '') FROM topics WHERE id = ?", id).Scan(&t.ID, &t.Name, &t.CreatedAt, &t.LeafNodeID)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, fmt.Errorf("topic %s not found", id)
 	}
@@ -239,7 +272,47 @@ func SaveMessages(db *sql.DB, topicID, runID string, msgs []Message) error {
 		return fmt.Errorf("begin tx: %w", err)
 	}
 	defer tx.Rollback()
+	if err := saveMessagesTx(tx, topicID, runID, msgs); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
 
+func scanMessages(rows *sql.Rows) ([]Message, error) {
+	var msgs []Message
+	for rows.Next() {
+		var (
+			role         string
+			content      sql.NullString
+			toolCallsRaw sql.NullString
+			toolCallID   sql.NullString
+			reasoning    sql.NullString
+		)
+		if err := rows.Scan(&role, &content, &toolCallsRaw, &toolCallID, &reasoning); err != nil {
+			return nil, fmt.Errorf("scan message: %w", err)
+		}
+
+		msg := Message{Role: role}
+		if content.Valid {
+			msg.Content = &content.String
+		}
+		if toolCallID.Valid {
+			msg.ToolCallID = toolCallID.String
+		}
+		if toolCallsRaw.Valid && toolCallsRaw.String != "" {
+			if err := json.Unmarshal([]byte(toolCallsRaw.String), &msg.ToolCalls); err != nil {
+				return nil, fmt.Errorf("unmarshal tool_calls: %w", err)
+			}
+		}
+		if reasoning.Valid {
+			msg.Reasoning = &reasoning.String
+		}
+		msgs = append(msgs, msg)
+	}
+	return msgs, rows.Err()
+}
+
+func saveMessagesTx(tx *sql.Tx, topicID, runID string, msgs []Message) error {
 	stmt, err := tx.Prepare(`
 		INSERT INTO messages (topic_id, run_id, role, content, tool_calls, tool_call_id, reasoning, created_at)
 		VALUES (?, ?, ?, ?, ?, ?, ?, ?)`)
@@ -278,40 +351,222 @@ func SaveMessages(db *sql.DB, topicID, runID string, msgs []Message) error {
 			return fmt.Errorf("insert message: %w", err)
 		}
 	}
+	return nil
+}
 
+func SaveMessagesAndAdvanceLeaf(db *sql.DB, topicID, runID string, msgs []Message) (string, error) {
+	tx, err := db.Begin()
+	if err != nil {
+		return "", fmt.Errorf("begin tx: %w", err)
+	}
+	defer tx.Rollback()
+
+	if err := saveMessagesTx(tx, topicID, runID, msgs); err != nil {
+		return "", err
+	}
+
+	var parentNodeID string
+	if err := tx.QueryRow(`SELECT COALESCE(parent_node_id, '') FROM runs WHERE id = ?`, runID).Scan(&parentNodeID); err != nil {
+		return "", fmt.Errorf("load run parent node: %w", err)
+	}
+
+	nodeID := uuid.NewString()[:8]
+	createdAt := time.Now().Unix()
+	if _, err := tx.Exec(`INSERT INTO session_nodes (id, topic_id, parent_id, run_id, summary, created_at) VALUES (?, ?, ?, ?, '', ?)`,
+		nodeID, topicID, nullableString(parentNodeID), runID, createdAt); err != nil {
+		return "", fmt.Errorf("insert session node: %w", err)
+	}
+	if _, err := tx.Exec(`UPDATE topics SET leaf_node_id = ? WHERE id = ?`, nodeID, topicID); err != nil {
+		return "", fmt.Errorf("update topic leaf: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return "", err
+	}
+	return nodeID, nil
+}
+
+func nullableString(value string) any {
+	if value == "" {
+		return nil
+	}
+	return value
+}
+
+func GetTopicLeafNodeID(db *sql.DB, topicID string) (string, error) {
+	var leaf string
+	if err := db.QueryRow(`SELECT COALESCE(leaf_node_id, '') FROM topics WHERE id = ?`, topicID).Scan(&leaf); err != nil {
+		return "", err
+	}
+	return leaf, nil
+}
+
+func ListSessionNodes(db *sql.DB, topicID string) ([]SessionNode, error) {
+	if err := EnsureTopicSessionTree(db, topicID); err != nil {
+		return nil, err
+	}
+	rows, err := db.Query(`SELECT id, topic_id, COALESCE(parent_id, ''), run_id, summary, created_at FROM session_nodes WHERE topic_id = ? ORDER BY created_at ASC`, topicID)
+	if err != nil {
+		return nil, fmt.Errorf("list session nodes: %w", err)
+	}
+	defer rows.Close()
+
+	var nodes []SessionNode
+	for rows.Next() {
+		var node SessionNode
+		if err := rows.Scan(&node.ID, &node.TopicID, &node.ParentID, &node.RunID, &node.Summary, &node.CreatedAt); err != nil {
+			return nil, fmt.Errorf("scan session node: %w", err)
+		}
+		nodes = append(nodes, node)
+	}
+	return nodes, rows.Err()
+}
+
+func GetSessionNode(db *sql.DB, nodeID string) (*SessionNode, error) {
+	var node SessionNode
+	err := db.QueryRow(`SELECT id, topic_id, COALESCE(parent_id, ''), run_id, summary, created_at FROM session_nodes WHERE id = ?`, nodeID).Scan(
+		&node.ID, &node.TopicID, &node.ParentID, &node.RunID, &node.Summary, &node.CreatedAt,
+	)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, fmt.Errorf("session node %s not found", nodeID)
+	}
+	if err != nil {
+		return nil, fmt.Errorf("get session node: %w", err)
+	}
+	return &node, nil
+}
+
+func CheckoutTopicNode(db *sql.DB, topicID, nodeID string) error {
+	node, err := GetSessionNode(db, nodeID)
+	if err != nil {
+		return err
+	}
+	if node.TopicID != topicID {
+		return fmt.Errorf("node %s does not belong to topic %s", nodeID, topicID)
+	}
+	_, err = db.Exec(`UPDATE topics SET leaf_node_id = ? WHERE id = ?`, nodeID, topicID)
+	return err
+}
+
+func UpdateSessionNodeSummaryByRunID(db *sql.DB, runID, summary string) error {
+	_, err := db.Exec(`UPDATE session_nodes SET summary = ? WHERE run_id = ?`, strings.TrimSpace(summary), runID)
+	return err
+}
+
+func EnsureTopicSessionTree(db *sql.DB, topicID string) error {
+	var existing int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM session_nodes WHERE topic_id = ?`, topicID).Scan(&existing); err != nil {
+		return err
+	}
+	if existing > 0 {
+		leaf, err := GetTopicLeafNodeID(db, topicID)
+		if err == nil && leaf != "" {
+			return nil
+		}
+		var fallback string
+		if err := db.QueryRow(`SELECT id FROM session_nodes WHERE topic_id = ? ORDER BY created_at DESC LIMIT 1`, topicID).Scan(&fallback); err == nil {
+			_, _ = db.Exec(`UPDATE topics SET leaf_node_id = ? WHERE id = ?`, fallback, topicID)
+		}
+		return nil
+	}
+
+	runs, err := getCompletedRuns(db, topicID)
+	if err != nil {
+		return err
+	}
+	if len(runs) == 0 {
+		return nil
+	}
+
+	tx, err := db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	parentID := ""
+	for _, run := range runs {
+		nodeID := uuid.NewString()[:8]
+		summary := SummaryForRunID(run.ID)
+		if _, err := tx.Exec(`INSERT INTO session_nodes (id, topic_id, parent_id, run_id, summary, created_at) VALUES (?, ?, ?, ?, ?, ?)`,
+			nodeID, topicID, nullableString(parentID), run.ID, strings.TrimSpace(summary), run.StartedAt); err != nil {
+			return fmt.Errorf("bootstrap session node: %w", err)
+		}
+		parentID = nodeID
+	}
+	if _, err := tx.Exec(`UPDATE topics SET leaf_node_id = ? WHERE id = ?`, parentID, topicID); err != nil {
+		return err
+	}
 	return tx.Commit()
 }
 
-func scanMessages(rows *sql.Rows) ([]Message, error) {
-	var msgs []Message
-	for rows.Next() {
-		var (
-			role         string
-			content      sql.NullString
-			toolCallsRaw sql.NullString
-			toolCallID   sql.NullString
-			reasoning    sql.NullString
-		)
-		if err := rows.Scan(&role, &content, &toolCallsRaw, &toolCallID, &reasoning); err != nil {
-			return nil, fmt.Errorf("scan message: %w", err)
-		}
-
-		msg := Message{Role: role}
-		if content.Valid {
-			msg.Content = &content.String
-		}
-		if toolCallID.Valid {
-			msg.ToolCallID = toolCallID.String
-		}
-		if toolCallsRaw.Valid && toolCallsRaw.String != "" {
-			if err := json.Unmarshal([]byte(toolCallsRaw.String), &msg.ToolCalls); err != nil {
-				return nil, fmt.Errorf("unmarshal tool_calls: %w", err)
-			}
-		}
-		if reasoning.Valid {
-			msg.Reasoning = &reasoning.String
-		}
-		msgs = append(msgs, msg)
+func LoadBranchRuns(db *sql.DB, topicID string) ([]CompletedRun, string, error) {
+	if err := EnsureTopicSessionTree(db, topicID); err != nil {
+		return nil, "", err
 	}
-	return msgs, rows.Err()
+	leafID, err := GetTopicLeafNodeID(db, topicID)
+	if err != nil {
+		return nil, "", err
+	}
+	if leafID == "" {
+		return nil, "", nil
+	}
+
+	nodesByID := make(map[string]SessionNode)
+	nodes, err := ListSessionNodes(db, topicID)
+	if err != nil {
+		return nil, "", err
+	}
+	for _, node := range nodes {
+		nodesByID[node.ID] = node
+	}
+
+	var branch []SessionNode
+	current := leafID
+	for current != "" {
+		node, ok := nodesByID[current]
+		if !ok {
+			break
+		}
+		branch = append(branch, node)
+		current = node.ParentID
+	}
+	sort.Slice(branch, func(i, j int) bool { return branch[i].CreatedAt < branch[j].CreatedAt })
+
+	completed := make([]CompletedRun, 0, len(branch))
+	for _, node := range branch {
+		var run CompletedRun
+		if err := db.QueryRow(`SELECT id, topic_id, started_at FROM runs WHERE id = ? AND status = 'done'`, node.RunID).Scan(&run.ID, &run.TopicID, &run.StartedAt); err != nil {
+			continue
+		}
+		completed = append(completed, run)
+	}
+	return completed, leafID, nil
+}
+
+func LoadBranchMessages(db *sql.DB, topicID string, limit int) ([]Message, string, error) {
+	runs, leafID, err := LoadBranchRuns(db, topicID)
+	if err != nil {
+		return nil, "", err
+	}
+	if len(runs) == 0 {
+		if limit > 0 {
+			msgs, err := LoadMessagesPage(db, topicID, limit)
+			return msgs, leafID, err
+		}
+		msgs, err := LoadMessages(db, topicID)
+		return msgs, leafID, err
+	}
+
+	var messages []Message
+	for _, run := range runs {
+		runMsgs, err := LoadMessagesByRunID(db, run.ID)
+		if err != nil {
+			continue
+		}
+		messages = append(messages, runMsgs...)
+	}
+	if limit > 0 && len(messages) > limit {
+		messages = messages[len(messages)-limit:]
+	}
+	return messages, leafID, nil
 }

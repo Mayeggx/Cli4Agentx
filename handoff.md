@@ -1,171 +1,128 @@
 # Handoff
 
-## Background
+## 背景
 
-This round refactored `cli-agentx` memory using the ideas from `doc/openviking_guide.md` and the `OpenViking` project, but kept the implementation lightweight and fully local.
+本轮工作围绕 `teams` 模式的真实回归问题展开，目标是修复默认 team 模板在端到端执行中的两个主要失败点：
 
-The main shift is:
-- treat memory as a small local file system, not only as rows in SQLite
-- introduce layered memory views (`L0/L1/L2`, `P0/P1/P2` style)
-- keep existing DB summaries/facts as compatibility storage
-- make recall work even without embeddings
-- add a simple local compaction lifecycle for old run notes
+1. team 角色无法读取仓库源码，只能访问 topic 目录，导致 `researcher-*` 角色缺乏真实代码证据。
+2. team 角色经常误用 `write`，或在探索阶段消耗过多轮次，触发 `agentic loop exceeded 20 iterations`。
 
-## What changed
+## 已完成改动
 
-### New file
+### 1. `internal/fs.go`
 
-- `cli-agentx/internal/memory_store.go`
+新增只读仓库浏览命令：
 
-Adds a local memory store under `data/memory/`.
+- `repo-ls [dir]`
+- `repo-cat <path>`
+- `repo-grep [-i] <pattern> [dir]`
 
-Main responsibilities:
-- create and maintain `data/memory/`
-- write run notes into `data/memory/runs/YYYY-MM-DD/*.md`
-- refresh `MEMORY.md`
-- refresh `SESSION-STATE.md`
-- refresh monthly `insights/YYYY-MM.md`
-- refresh `lessons/operational-lessons.jsonl`
-- generate `.abstract` index files
-- provide local memory search via lightweight lexical scoring
-- compact old run notes into `data/memory/archive/runs/`
+这些命令以仓库根目录为只读范围，不写入任何文件，供 team 角色在保持 topic 沙箱写隔离的前提下读取真实源码。
 
-### Updated files
+### 2. `cmd/agent/teams_runtime.go`
 
-- `cli-agentx/internal/memory.go`
-  - `SearchMemory()` now combines semantic, FTS, and lexical fallback
-  - lowered semantic threshold from `0.5` to `0.45`
-  - added `SearchAllMemory()` and `RecallMemories()`
-  - `StoreFact()` and `DeleteFact()` now sync local memory store
-  - `ProcessMemory()` now writes DB summary and also syncs local file memory
+#### team 角色系统提示增强
 
-- `cli-agentx/internal/context.go`
-  - `buildRecall()` now uses `RecallMemories()` instead of embedding-only recall
-  - recall output now includes memory layer labels
+新增并强化了以下约束：
 
-- `cli-agentx/internal/tools.go`
-  - `memory search` now queries layered local memory + DB memory
-  - `memory recent` now shows `SESSION-STATE.md` first, then DB summaries
-  - added `memory compact [days]`
-  - help text updated to match new behavior
+- 明确区分 team 工件路径 `/<topic-id>/...` 与仓库源码路径。
+- 强制工件写入使用 `write /<topic-id>/<file>`，禁止 heredoc、shell 重定向等伪 shell 写法。
+- 指导 team 角色使用 `repo-ls` / `repo-cat` / `repo-grep` 读取源码。
+- 增加“避免无节制探索”的提示，要求优先读最相关的 3-6 个文件。
+- 为 `researcher-codebase`、`researcher-risks`、`tester` 添加了更具体的角色级指导。
 
-- `cli-agentx/README.md`
-  - documented the local memory compaction concept
-  - documented `memory compact 7` usage example
+#### team 角色完成时序调整
 
-## Current memory layout
+`executeTeamRole()` 中把：
 
-Generated under:
-- `cli-agentx/data/memory/`
+- `markRoleFinished(teamRunID, roleIndex, "done", ...)`
 
-Important files:
-- `cli-agentx/data/memory/.abstract`
-- `cli-agentx/data/memory/MEMORY.md`
-- `cli-agentx/data/memory/SESSION-STATE.md`
-- `cli-agentx/data/memory/insights/.abstract`
-- `cli-agentx/data/memory/insights/2026-03.md`
-- `cli-agentx/data/memory/lessons/.abstract`
-- `cli-agentx/data/memory/lessons/operational-lessons.jsonl`
-- `cli-agentx/data/memory/archive/runs/`
+移动到：
 
-Notes:
-- `runs/` files are only created when `ProcessMemory()` runs for new completed runs
-- `memory compact [days]` moves older day folders from `runs/` to `archive/runs/`
-- current compaction only archives raw run notes; it does not yet rebuild deeper summaries
+- `internal.ProcessMemory(...)`
 
-## Why this design
+之前执行，避免 memory 后处理阻塞 stage 推进。
 
-This is intentionally not a heavy OpenViking port.
+#### stage 等待逻辑收敛
 
-It keeps the design ideas only:
-- directory-style memory navigation
-- hot vs warm vs raw memory separation
-- local-first recall
-- compact and inspectable files
-- simple lifecycle management for raw memory
+`waitForTeamRoleCompletion()` 现在在 `run.Status != "running"` 后会额外等待 team state 收敛：
 
-This makes it:
-- runnable locally
-- easy to inspect and debug
-- less dependent on embedding quality
-- compatible with current `cli-agentx` DB design
-- safer to grow incrementally
+- 若子进程仍存活，则继续短轮询。
+- 若 run 已结束但 team role state 还未落盘，则给出宽限窗口再判定。
 
-## Validation done
+这避免了早期版本中 “run 已 done，但 role 仍显示 running” 被父调度器误判失败。
 
-Ran successfully:
+## 真实回归结果
 
-```bash
-cd cli-agentx
-gofmt -w internal/memory.go internal/memory_store.go internal/context.go internal/tools.go
-go build ./...
-```
+### 已验证通过
 
-Also verified:
-- `SyncLocalMemoryStore()` can generate `data/memory/`
-- `SearchLocalMemory()` can recall name/job style facts from natural Chinese queries
-- `memory compact 7` is available through the command registry and builds successfully
+最新一轮具有代表性的真实回归是：
 
-Temporary validation files were removed afterward.
+- team run: `867a9776`
+- coordinator topic: `aa02e8e9`
 
-## Important caveats
+在这一轮中，以下行为已经被真实验证：
 
-1. `SearchAllMemory()` only weakly filters local file hits by topic
-   - current logic checks `TopicID` against hit text/source string
-   - acceptable for prototype, but not exact
+- `planner` 成功完成并进入 stage 1。
+- `researcher-codebase` 成功完成，不再触发 20 轮上限。
+- `researcher-codebase` 成功产出 `aa02e8e9/research-codebase.md`。
+- team 通信链路已打通，`researcher-codebase -> researcher-risks` 的消息被持久化到：
+  - team run state `data/teams/runs/867a9776.json`
+  - `data/topics/aa02e8e9/team-messages.md`
 
-2. `MEMORY.md` currently mirrors recent DB summaries
-   - it is a distilled view, but not yet a true compaction pipeline
+### 仍未闭环的问题
 
-3. local lexical recall is heuristic
-   - good enough for demo/prototype
-   - not intended as final ranking logic
+在同一轮回归中：
 
-4. `memory compact` currently only archives old run notes
-   - it does not yet trim or rewrite `SESSION-STATE.md` from archived material
-   - it relies on normal refresh logic, not a separate summarization pass
+- `researcher-risks` 最终没有成功收尾。
+- `implementer` 和 `tester` 因上游未全部完成而未进入执行。
 
-5. old issue in test report still conceptually exists
-   - if the model outputs `run(command="...")` as plain text instead of actual tool calls, the tool is still not executed automatically
-   - this refactor improved recall/memory structure, not tool-call recovery
+当前掌握的信息：
 
-## Suggested next steps
+- `researcher-risks` 仍可能在探索阶段耗尽轮次或异常退出。
+- `data/teams/runs/867a9776.json` 最终 `status` 为 `error`，且 `researcher-risks` 状态与 run 结束状态存在不一致现象。
+- 我已经继续把 `researcher-risks` 的角色级提示收紧为：
+  - 只看少量关键片段
+  - 前 2-3 次工具调用内先发消息
+  - 拿到 3-5 个风险点后立即写工件
 
-### Option B: improve layered retrieval UX
+但这最后一版还没有完成一次新的全链路验证。
 
-Make `memory search` return two stages:
-- first show `L0/L1` summaries
-- then allow follow-up detail read from `L2` run notes
-- optionally group output by layer instead of one flat ranking
+## 当前代码状态
 
-### Option C: handle text-form tool-call fallback
+本轮实际改动文件：
 
-For the issue described in `cli-agentx/doc/memory-test-report.md`:
-- detect assistant plain-text outputs like `run(command="memory store ...")`
-- optionally auto-execute them if safe
-- or add stricter prompt/tool-call enforcement
+- `internal/fs.go`
+- `cmd/agent/teams_runtime.go`
+- `README.md`
+- `handoff.md`
 
-### Option D: make compaction smarter
+编译与静态检查状态：
 
-Improve `memory compact` so it can:
-- refresh `SESSION-STATE.md` as a true hot-only buffer
-- write an archive index or monthly archive digest
-- support preview/dry-run mode
+- `go build -o agent ./cmd/agent` 通过
+- 已修改文件无新的 linter 报错
 
-## Useful files for next task
+## 建议的下一步
 
-Reference material:
-- `doc/openviking_guide.md`
-- `OpenViking/bot/workspace/memory/MEMORY.md`
-- `OpenViking/examples/claude-memory-plugin/README.md`
+建议按这个顺序继续：
 
-Main implementation files:
-- `cli-agentx/internal/memory_store.go`
-- `cli-agentx/internal/memory.go`
-- `cli-agentx/internal/context.go`
-- `cli-agentx/internal/tools.go`
+1. 用最新二进制重新跑一轮完整 `teams run default`。
+2. 重点观察 `researcher-risks` 是否还能触发 20 轮上限。
+3. 如果 `researcher-risks` 仍失败，优先读取其 `get-run --output raw` 结果，确认是：
+   - 读太多文件
+   - `team send` / `team messages` 交互循环
+   - 还是写工件前耗尽轮次
+4. 一旦 stage 1 两个 researcher 都通过，再继续验证：
+   - `implementer` 是否成功读取两个 research 工件
+   - `tester` 是否产出包含“通过项 / 风险项 / 未验证项”的 `test-report.md`
+5. 若需要进一步降低探索轮次，可继续在 `buildTeamRoleSystemPrompt()` 中对 `researcher-risks` 增加更硬的工具预算或文件白名单。
 
-Related existing docs:
-- `cli-agentx/doc/memory-test-report.md`
-- `cli-agentx/README.md`
-- `cli-agentx/doc/memory-simple-guide.md`
+## 参考文件
+
+- `cmd/agent/teams_runtime.go`
+- `internal/fs.go`
+- `internal/team_tools.go`
+- `internal/teams.go`
+- `data/teams/runs/867a9776.json`
+- `data/topics/aa02e8e9/research-codebase.md`
+- `data/topics/aa02e8e9/team-messages.md`

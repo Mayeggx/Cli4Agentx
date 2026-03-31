@@ -56,8 +56,9 @@ user 消息包含 XML 标签：
 
 // ContextResult holds the assembled context for a new Run.
 type ContextResult struct {
-	SystemPrompt string    // base + facts (stable, cacheable)
-	Messages     []Message // topic history + recent runs + new user message
+	SystemPrompt string         // base + facts (stable, cacheable)
+	Messages     []AgentMessage // layered runtime messages
+	ParentNodeID string         // current branch leaf before this run
 }
 
 // BuildContext assembles the full LLM context for a new Run.
@@ -77,16 +78,16 @@ func BuildContext(db *sql.DB, cfg *Config, topicID, userMessage string) (*Contex
 		systemPrompt += fb.String()
 	}
 
-	completedRuns, err := getCompletedRuns(db, topicID)
+	completedRuns, parentNodeID, err := LoadBranchRuns(db, topicID)
 	if err != nil {
 		return nil, err
 	}
 
-	var messages []Message
+	var messages []AgentMessage
 
 	if len(completedRuns) == 0 {
 		messages = append(messages, wrapUserMessage(cfg, db, topicID, userMessage))
-		return &ContextResult{SystemPrompt: systemPrompt, Messages: messages}, nil
+		return &ContextResult{SystemPrompt: systemPrompt, Messages: messages, ParentNodeID: parentNodeID}, nil
 	}
 
 	var summaryRuns, fullRuns []CompletedRun
@@ -100,8 +101,8 @@ func BuildContext(db *sql.DB, cfg *Config, topicID, userMessage string) (*Contex
 	if len(summaryRuns) > 0 {
 		historyText := buildTopicHistory(db, summaryRuns)
 		if historyText != "" {
-			messages = append(messages, TextMessage("user", historyText))
-			messages = append(messages, TextMessage("assistant", "了解"))
+			messages = append(messages, AgentTextMessage("history_summary", "user", historyText, true, false))
+			messages = append(messages, AgentTextMessage("history_summary_ack", "assistant", "了解", true, false))
 		}
 	}
 
@@ -110,15 +111,15 @@ func BuildContext(db *sql.DB, cfg *Config, topicID, userMessage string) (*Contex
 		if err != nil {
 			continue
 		}
-		messages = append(messages, runMsgs...)
+		messages = append(messages, WrapMessages("history_message", runMsgs, true, true)...)
 	}
 
 	messages = append(messages, wrapUserMessage(cfg, db, topicID, userMessage))
 
-	return &ContextResult{SystemPrompt: systemPrompt, Messages: messages}, nil
+	return &ContextResult{SystemPrompt: systemPrompt, Messages: messages, ParentNodeID: parentNodeID}, nil
 }
 
-func wrapUserMessage(cfg *Config, db *sql.DB, topicID, userMessage string) Message {
+func wrapUserMessage(cfg *Config, db *sql.DB, topicID, userMessage string) AgentMessage {
 	var b strings.Builder
 
 	fmt.Fprintf(&b, "<user>\n%s\n</user>", userMessage)
@@ -133,7 +134,7 @@ func wrapUserMessage(cfg *Config, db *sql.DB, topicID, userMessage string) Messa
 		fmt.Fprintf(&b, "\n\n<environment>\n%s</environment>", env)
 	}
 
-	return TextMessage("user", b.String())
+	return AgentTextMessage("user_input", "user", b.String(), true, true)
 }
 
 func buildRecall(db *sql.DB, cfg *Config, topicID, userMessage string) string {

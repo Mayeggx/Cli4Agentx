@@ -22,6 +22,7 @@ type Output interface {
 	ToolResult(content string)
 	Inject(content string)
 	Done()
+	Event(event AgentEvent)
 }
 
 // --- CLIOutput: human-readable, stdout + stderr ---
@@ -56,6 +57,8 @@ func (o *CLIOutput) ToolResult(content string) {
 func (o *CLIOutput) Inject(content string) {
 	fmt.Fprintf(o.err, "[injected] %s\n", content)
 }
+
+func (o *CLIOutput) Event(event AgentEvent) {}
 
 // --- JSONLOutput: structured, all on stdout ---
 
@@ -106,6 +109,10 @@ func (o *JSONLOutput) Inject(content string) {
 
 func (o *JSONLOutput) Done() {
 	o.emit(map[string]string{"type": "done"})
+}
+
+func (o *JSONLOutput) Event(event AgentEvent) {
+	o.emit(event)
 }
 
 // NewOutput creates an Output based on format string ("raw" or "jsonl").

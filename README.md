@@ -16,8 +16,13 @@
 - **本地优先**：运行、存储、记忆、日志都在本地目录，便于调试和审计
 - **文件系统记忆**：记忆完全基于 `data/memory/`，不依赖向量数据库
 - **Agentic Loop**：支持多轮工具调用、异步运行、运行中注入消息
+- **事件流运行时**：agent_start / turn / tool / message 等阶段都会输出结构化事件
+- **分层消息**：运行态消息和发给 LLM 的消息分层管理，减少上下文污染
 - **完整日志**：每次 LLM 调用都会写入 JSON 日志，方便复盘问题
+- **树状会话**：每个 topic 现在保留 run 分支树，可回看和切换历史分支
+- **钩子机制**：主循环预留 context / before_tool / after_tool / before_finish 拦截点
 - **会话隔离**：每个话题有独立的文件目录和运行历史
+- **Agent Teams**：支持按 `depends_on` 自动切并行 stage，把多个 researcher 并发执行后再进入 implementer，并提供 team 内通信命令
 
 ## 工作方式
 
@@ -25,19 +30,31 @@
 
 ```text
 用户消息
-  → BuildContext（系统提示 + 历史 + recall + 环境信息）
-  → RunLoop
+  → BuildContext（系统提示 + 分支历史 + recall + 环境信息）
+  → Hooks.TransformContext
+  → RunLoop（事件流）
+      ├─ agent_start / turn_start
       ├─ CallLLM（流式）
-      ├─ 如果有 tool_calls → 执行 run(command="...")
-      ├─ 追加 tool_result 再继续推理
-      └─ 没有 tool_calls → 输出最终回复
-  → 保存消息
-  → 异步整理本地记忆
+      ├─ 如果有 tool_calls
+      │    ├─ before_tool hook
+      │    ├─ 执行 run(command="...")
+      │    ├─ after_tool hook
+      │    └─ 追加 tool_result 再继续推理
+      └─ 没有 tool_calls
+           ├─ before_finish hook
+           └─ 输出最终回复
+  → 保存消息并推进 topic 当前 leaf
+  → 异步整理本地记忆并回写节点摘要
 ```
 
 ## 记忆系统
 
 当前版本的记忆系统是**纯文件系统方案**。
+
+同时，会话主干已经升级为 **topic 内的 run 树**：
+- topic 保留一个当前 `leaf`
+- 每次成功 run 都会挂成一个新节点
+- 可以切回旧节点继续，形成分支
 
 ### 设计原则
 
@@ -98,6 +115,7 @@ cli-agentx/
 │   ├── main.go             # CLI 入口
 │   ├── cli_helpers.go      # 输出/子进程/注册表辅助
 │   ├── send_cmd.go         # send 命令
+│   ├── teams_cmd.go        # agent teams 命令
 │   ├── topic_cmd.go        # topic/run 相关命令
 │   ├── config_cmd.go       # 配置命令
 │   ├── skill_cmd.go        # skill 命令
@@ -121,12 +139,14 @@ cli-agentx/
 │   ├── output.go           # 输出格式
 │   ├── sanitize.go         # 用户内容/think 提取
 │   ├── media.go            # 图片 MIME 处理
+│   ├── teams.go            # team 配置 / 状态
 │   └── upload.go           # 附件上传
 │
 ├── seed/
 │   ├── schema.sql          # 初始 SQLite 表结构
 │   ├── config.yaml         # 默认配置模板
-│   └── skills/             # 内置 skills
+│   ├── skills/             # 内置 skills
+│   └── teams/              # 内置 team 模板与角色 prompts
 │
 ├── data/
 │   ├── agent.db            # topics/messages/runs 数据库
@@ -260,6 +280,62 @@ printf '%s' '{
 
 上传后的附件可在 `send` 的 JSON 输入里通过 `attachments` 传入。
 
+### 8. 运行 agent teams
+
+内置了一个 `default` team 模板，按 `planner -> (researcher-codebase || researcher-risks) -> implementer -> tester` 执行。
+
+```bash
+# 查看可用 team
+./agent teams list
+
+# 查看默认 team 配置
+./agent teams show default
+
+# 直接运行默认 team
+./agent teams run default -p "为当前任务制定计划并产出验证报告"
+
+# 使用 tmux 运行，让每个角色在独立 tmux window 中执行
+./agent teams run default -p "整理一个多角色工作流" --runner tmux
+
+# 查看 team run 状态
+./agent teams status <team-run-id>
+
+# 把默认模板复制到 data/teams/my-team/ 里进行自定义
+./agent teams init my-team
+```
+
+team 会创建一个协调 topic，把共享工件写到该 topic 目录中：
+
+- `task.md`：原始任务
+- `manifest.md`：角色、topic、artifact 对照
+- `plan.md` / `research-codebase.md` / `research-risks.md` / `implementation.md` / `test-report.md`：默认角色产物
+- `team-messages.md`：team 内部消息日志
+
+并发 stage 中，运行中的角色可通过唯一工具里的 `team` 子命令互相通信：
+
+```bash
+run(command="team status")
+run(command="team send researcher-risks \"请补充登录失败路径的边界条件\"")
+run(command="team broadcast \"我已经确认当前模块没有现成测试\"")
+run(command="team messages 20")
+```
+
+默认会把通信范围限制在**当前并发 stage 且正在运行的其他角色**，这样可以减少对下游 stage 的提前污染。
+
+当 team 角色需要读取当前仓库源码而不是 coordinator topic 工件时，应使用只读仓库命令：
+
+```bash
+run(command="repo-ls internal/")
+run(command="repo-cat cmd/agent/teams_runtime.go | head -n 120")
+run(command="repo-grep SendTeamMessages internal/")
+```
+
+约定上：
+
+- `cat /<topic-id>/...` 用于读取 team 共享工件
+- `write /<topic-id>/<file>` 用于写回 team 工件
+- `repo-*` 只用于读取仓库源码，不会写入仓库文件
+
 ---
 
 ## CLI 命令
@@ -275,6 +351,7 @@ printf '%s' '{
 - `config`
 - `skill`
 - `upload`
+- `teams`
 
 所有命令都支持：
 - `--output raw`
@@ -295,9 +372,10 @@ run(command="...")
 | 类别 | 命令 | 说明 |
 |------|------|------|
 | 文件 | `ls`, `cat`, `write`, `stat`, `rm`, `cp`, `mv`, `mkdir`, `see` | 操作 topic 目录内文件 |
+| 仓库只读 | `repo-ls`, `repo-cat`, `repo-grep` | 从仓库根目录只读浏览源码，适合 team 角色调研代码 |
 | 文本 | `grep`, `head`, `tail`, `wc`, `echo` | 文本处理 |
 | 记忆 | `memory search/recent/compact/store/facts/forget` | 本地记忆检索与管理 |
-| 话题 | `topic list/info/runs/run/rename/search` | topic / run 浏览 |
+| 话题 | `topic list/info/runs/run/tree/checkout/rename/search` | topic / run 浏览与分支切换 |
 | Skill | `skill list/load/search/create/update/delete` | 经验与指南复用 |
 | 配置 | `config set/delete` | 修改运行配置 |
 | 系统 | `time`, `help` | 通用辅助 |
@@ -398,7 +476,10 @@ run(command="memory compact 7")
 - 基于 topic / run 的会话组织方式
 
 如果你准备继续扩展，建议优先看这些文件：
-- `cli-agentx/internal/context.go`
+- `cli-agentx/internal/runtime.go`（分层消息、事件、hooks）
+- `cli-agentx/internal/context.go`（按当前分支构建上下文）
+- `cli-agentx/internal/db.go`（session node / leaf 管理）
+- `cli-agentx/internal/loop.go`（事件化 agent loop）
 - `cli-agentx/internal/memory.go`
 - `cli-agentx/internal/memory_store.go`
 - `cli-agentx/internal/tools.go`

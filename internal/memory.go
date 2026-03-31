@@ -404,6 +404,7 @@ func ProcessMemory(db *sql.DB, cfg *Config, topicID, runID string, newMsgs []Mes
 	}
 
 	summary, _ := GenerateSummary(db, cfg, newMsgs)
+	_ = UpdateSessionNodeSummaryByRunID(db, runID, summary)
 	if err := SyncLocalMemoryStore(db, topicID, runID, userMessage, summary); err != nil {
 		return
 	}
