@@ -3,8 +3,9 @@
 一个纯本地运行的 AI Agent CLI。
 
 它把 LLM、工具调用、话题管理、运行日志和文件系统记忆整合成一个单二进制工作流：
-- 用 `agent send` 发起或继续对话
-- 用 `run(command="...")` 让模型调用本地命令
+- 用 `agent send --worktree <name>` 在隔离 Git worktree 中发起或继续对话
+- 用受审批、受沙箱保护的 `shell <program> [arg...]` 调用外部程序
+- 用 `data/checkpoints/` 保存可恢复的 Agent 执行检查点
 - 用 `data/memory/` 保存可读、可检索、可压缩的本地记忆
 - 用 `logs/` 保留完整 LLM 请求/响应日志
 
@@ -12,7 +13,11 @@
 
 ## 特性
 
-- **单工具模型**：LLM 只有一个工具 `run(command, stdin?)`，所有能力都走命令行子命令
+- **单工具模型**：LLM 通过 `run(command, stdin?)` 调用内置子命令；外部程序仅能经受控 `shell` 子命令执行
+- **隔离执行**：每个 Agent run 在受管理 Git worktree 中运行，主仓库不能作为外部命令的写入目录
+- **命令审批**：默认逐条确认外部命令；`--yes` 只对当前一次 `agent send` 有效
+- **操作系统沙箱**：默认要求 macOS `sandbox-exec` 或 Linux `bwrap`，默认禁用网络
+- **可恢复运行**：在模型调用前、工具调用后和结束时自动保存 checkpoint
 - **本地优先**：运行、存储、记忆、日志都在本地目录，便于调试和审计
 - **文件系统记忆**：记忆完全基于 `data/memory/`，不依赖向量数据库
 - **Agentic Loop**：支持多轮工具调用、异步运行、运行中注入消息
@@ -34,18 +39,68 @@
   → Hooks.TransformContext
   → RunLoop（事件流）
       ├─ agent_start / turn_start
+      ├─ 保存 `before_llm` checkpoint
       ├─ CallLLM（流式）
       ├─ 如果有 tool_calls
       │    ├─ before_tool hook
-      │    ├─ 执行 run(command="...")
+      │    ├─ 执行内置命令或受控 `shell`
+      │    ├─ 外部命令：审批 → OS 沙箱 → 审计
       │    ├─ after_tool hook
+      │    ├─ 保存 `after_tool` checkpoint
       │    └─ 追加 tool_result 再继续推理
       └─ 没有 tool_calls
+           ├─ 保存 `completed` checkpoint
            ├─ before_finish hook
            └─ 输出最终回复
   → 保存消息并推进 topic 当前 leaf
   → 异步整理本地记忆并回写节点摘要
 ```
+
+## 隔离执行、审批与恢复
+
+### 受管理 Git worktree
+
+外部命令仅可在受管理 Git worktree 中执行；主仓库和任意未受管理目录都会被拒绝。`agent send --worktree <name>` 会基于配置的 `base_branch`（默认 `main`）创建或复用 `agentx/<name>` 分支及其隔离目录。
+
+```bash
+# 创建隔离 worktree 并在其中执行 Agent。
+./agent send --worktree feature-a -p "实现当前需求"
+
+# 也可单独管理 worktree。
+./agent worktree create feature-a
+./agent worktree list
+./agent worktree remove feature-a
+```
+
+默认 worktree 根目录是 `.agentx/worktrees/`。创建时会写入仅作用于该目录的 `.gitignore`，避免 worktree 容器出现在主仓库 Git 状态中。`remove` 默认拒绝删除存在未提交修改的 worktree；仅显式传入 `--force` 时才会强制删除。
+
+### 命令审批与 OS 沙箱
+
+Agent 的内置文件、记忆和话题命令仍由运行时处理。调用外部程序时必须使用 `shell <program> [arg...]`，并具有以下约束：
+
+- 不启动 Shell，禁止 `sh`、`bash`、`zsh`、管道、重定向和命令替换；
+- 默认每条外部命令均需要确认，输入 `y` 或 `yes` 才会运行；
+- `agent send --yes` 仅自动批准当前一次 run，不能持久化更改审批策略；
+- macOS 使用 `sandbox-exec`，Linux 使用 `bwrap`；默认禁网、超时 120 秒、输出上限 4 MiB；
+- 审批事件写入 `data/audit/command-approvals.jsonl`，包含敏感名称的参数会被脱敏；
+- 受控 `git` 命令仅额外访问 linked worktree 所需的 Git 元数据目录。
+
+默认策略会在缺少 OS 沙箱时失败关闭。只有可信的本地开发环境，才应由用户在配置中显式设为 `runtime.sandbox.mode: disabled`。
+
+### Checkpoint 恢复
+
+每个 run 在模型请求前、工具结果写入后以及完成时都会保存 checkpoint。检查点存放在 `data/checkpoints/<run-id>/`，采用仅当前用户可读写的文件权限。
+
+```bash
+./agent checkpoint list --run <run-id>
+./agent checkpoint show --run <run-id> <checkpoint-id>
+./agent checkpoint delete --run <run-id> <checkpoint-id>
+
+# 恢复时会验证并自动回到 checkpoint 原先记录的受管理 worktree。
+./agent send --resume-run <run-id> --checkpoint <checkpoint-id>
+```
+
+恢复 checkpoint 时不能额外传入 `--worktree`，也不能切换到其他目录，以避免消息上下文与实际修改目录不一致。
 
 ## 记忆系统
 
@@ -112,22 +167,19 @@ data/memory/
 ```text
 cli-agentx/
 ├── cmd/agent/
-│   ├── main.go             # CLI 入口
-│   ├── cli_helpers.go      # 输出/子进程/注册表辅助
-│   ├── send_cmd.go         # send 命令
-│   ├── teams_cmd.go        # agent teams 命令
-│   ├── topic_cmd.go        # topic/run 相关命令
-│   ├── config_cmd.go       # 配置命令
-│   ├── skill_cmd.go        # skill 命令
-│   └── worker_cmd.go       # 异步 worker / 记忆整理 worker
+│   └── main.go             # send、worktree、checkpoint CLI 入口
 │
 ├── internal/
-│   ├── loop.go             # Agentic loop
+│   ├── loop.go             # Agentic loop 与 checkpoint 保存时机
+│   ├── checkpoint.go       # 私有 checkpoint 持久化与恢复校验
+│   ├── secure_execution.go # 命令审批、审计、超时与 OS 沙箱执行器
+│   ├── secure_commands.go  # 受控 shell 子命令注册
+│   ├── worktree.go         # 受管理 Git worktree 生命周期
 │   ├── llm.go              # OpenAI 兼容流式调用
 │   ├── llm_anthropic.go    # Anthropic 调用
 │   ├── logger.go           # LLM 调用日志
 │   ├── tools.go            # run 工具注册表与内置命令
-│   ├── chain.go            # 命令链解析（&& ; || |）
+│   ├── chain.go            # 内置命令链解析（&& ; || |）
 │   ├── config.go           # YAML 配置读写
 │   ├── db.go               # topics/messages/runs 存储
 │   ├── run.go              # Run 生命周期
@@ -151,6 +203,8 @@ cli-agentx/
 ├── data/
 │   ├── agent.db            # topics/messages/runs 数据库
 │   ├── config.yaml         # 实际运行配置
+│   ├── checkpoints/        # 每次 run 的私有恢复点
+│   ├── audit/              # 外部命令审批审计日志
 │   ├── memory/             # 本地记忆目录
 │   ├── skills/             # skills
 │   ├── topics/             # 每个 topic 的文件目录
@@ -183,17 +237,37 @@ go build -o agent ./cmd/agent
 name: pi
 
 providers:
-  dashscope:
-    base_url: https://dashscope.aliyuncs.com/compatible-mode/v1
-    api_key: sk-your-key-here
+  openrouter:
+    base_url: https://openrouter.ai/api/v1
+    api_key: ""              # 不在配置文件中保存密钥
 
-llm_provider: dashscope
-llm_model: qwen-plus
+llm_provider: openrouter
+llm_model: anthropic/claude-3.5-haiku
+
+runtime:
+  sandbox:
+    mode: required          # `required` 或仅可信环境下的 `disabled`
+    allow_network: false
+    timeout_seconds: 120
+  command_approval:
+    mode: always            # `always`、`dangerous`、`never`
+    audit: true
+  worktree:
+    base_branch: main
+    root_dir: .agentx/worktrees
 
 system_prompt: |
   你是一个高效的 AI 助手。
   简洁直接，优先完成任务。
 ```
+
+配置 OpenRouter 时，请在启动前提供 API Key：
+
+```bash
+export OPENROUTER_API_KEY='...'
+```
+
+不要将 API Key 写入 `data/config.yaml`、worktree、prompt、checkpoint 或审计日志。
 
 支持的模型协议：
 - **OpenAI 兼容**：如 DashScope、OpenRouter、DeepSeek 等
@@ -202,160 +276,47 @@ system_prompt: |
 ### 3. 发送消息
 
 ```bash
-# 新建 topic 并发送
-./agent send -p "帮我分析一下当前目录的文件结构"
+# 创建隔离 worktree 并在其中执行；外部命令只可在此目录内运行。
+./agent send --worktree analyze-repo -p "帮我分析一下当前目录的文件结构"
 
-# 在指定 topic 中继续
-./agent send -t <topic-id> -p "继续上面的任务"
+# 复用已有隔离 worktree，在指定 topic 中继续。
+./agent send --worktree analyze-repo -t <topic-id> -p "继续上面的任务"
 
-# 异步运行
-./agent send -t <topic-id> -p "执行一个耗时任务" --async
+# 仅在可信任务中为当前 run 自动批准外部命令。
+./agent send --worktree analyze-repo --yes -p "运行已确认的测试命令"
 ```
 
-### 4. 查看 topic 和 run
+### 4. 管理 worktree 和 checkpoint
 
 ```bash
-# 创建 topic
-./agent create-topic -n "排查 Redis 延迟"
+# 显式创建、列出和删除受管理 worktree。
+./agent worktree create feature-a
+./agent worktree list
+./agent worktree remove feature-a
 
-# 列出 topics
-./agent list-topics
+# 查看某个 run 的可恢复状态。
+./agent checkpoint list --run <run-id>
+./agent checkpoint show --run <run-id> <checkpoint-id>
 
-# 查看 topic 消息
-./agent get-topic <topic-id>
-
-# 查看 run 状态/输出
-./agent get-run <run-id>
-
-# 取消运行中的 run
-./agent cancel-run <run-id>
+# 恢复时自动回到 checkpoint 的原始 worktree。
+./agent send --resume-run <run-id> --checkpoint <checkpoint-id>
 ```
 
 ### 5. 修改配置
 
-```bash
-# 查看配置（敏感字段已脱敏）
-./agent config
-
-# 设置配置项
-./agent config set providers.dashscope.api_key sk-xxx
-
-# 删除配置项
-./agent config delete browser
-```
-
-### 6. 管理 skills
-
-```bash
-# 列出 skills
-./agent skill list
-
-# 查看 skill
-./agent skill get daily-journal
-
-# 删除 skill
-./agent skill delete daily-journal
-```
-
-`skill save` 使用 stdin JSON：
-
-```bash
-printf '%s' '{
-  "name": "daily-journal",
-  "description": "记录每日总结",
-  "content": "先收集今天完成的事项，再按要点输出。"
-}' | ./agent skill save
-```
-
-### 7. 上传附件
-
-`upload` 使用 stdin JSON：
-
-```bash
-printf '%s' '{
-  "topic_id": "<topic-id>",
-  "path": "/absolute/path/to/file.png"
-}' | ./agent upload
-```
-
-上传后的附件可在 `send` 的 JSON 输入里通过 `attachments` 传入。
-
-### 8. 运行 agent teams
-
-内置了一个 `default` team 模板，按 `planner -> (researcher-codebase || researcher-risks) -> implementer -> tester` 执行。
-
-```bash
-# 查看可用 team
-./agent teams list
-
-# 查看默认 team 配置
-./agent teams show default
-
-# 直接运行默认 team
-./agent teams run default -p "为当前任务制定计划并产出验证报告"
-
-# 使用 tmux 运行，让每个角色在独立 tmux window 中执行
-./agent teams run default -p "整理一个多角色工作流" --runner tmux
-
-# 查看 team run 状态
-./agent teams status <team-run-id>
-
-# 把默认模板复制到 data/teams/my-team/ 里进行自定义
-./agent teams init my-team
-```
-
-team 会创建一个协调 topic，把共享工件写到该 topic 目录中：
-
-- `task.md`：原始任务
-- `manifest.md`：角色、topic、artifact 对照
-- `plan.md` / `research-codebase.md` / `research-risks.md` / `implementation.md` / `test-report.md`：默认角色产物
-- `team-messages.md`：team 内部消息日志
-
-并发 stage 中，运行中的角色可通过唯一工具里的 `team` 子命令互相通信：
-
-```bash
-run(command="team status")
-run(command="team send researcher-risks \"请补充登录失败路径的边界条件\"")
-run(command="team broadcast \"我已经确认当前模块没有现成测试\"")
-run(command="team messages 20")
-```
-
-默认会把通信范围限制在**当前并发 stage 且正在运行的其他角色**，这样可以减少对下游 stage 的提前污染。
-
-当 team 角色需要读取当前仓库源码而不是 coordinator topic 工件时，应使用只读仓库命令：
-
-```bash
-run(command="repo-ls internal/")
-run(command="repo-cat cmd/agent/teams_runtime.go | head -n 120")
-run(command="repo-grep SendTeamMessages internal/")
-```
-
-约定上：
-
-- `cat /<topic-id>/...` 用于读取 team 共享工件
-- `write /<topic-id>/<file>` 用于写回 team 工件
-- `repo-*` 只用于读取仓库源码，不会写入仓库文件
-
----
+`data/config.yaml` 是用户持有的安全策略文件。请在启动 Agent 前手动编辑它；运行中的 Agent 只能查看配置，不能通过工具修改 `sandbox`、`command_approval` 或 `worktree`。API Key 等敏感值仅应通过环境变量提供，勿写入配置文件、worktree、prompt、checkpoint 或审计日志。
 
 ## CLI 命令
 
-顶层 Cobra 命令：
+| 命令 | 说明 |
+|---|---|
+| `agent send --worktree <name> -p <prompt>` | 创建或复用隔离 worktree 后运行 Agent |
+| `agent send --worktree <name> --yes -p <prompt>` | 仅为当前 run 自动批准外部命令 |
+| `agent send --resume-run <run-id> --checkpoint <id>` | 在 checkpoint 的原 worktree 中恢复 |
+| `agent worktree create/list/remove` | 管理 `agentx/<name>` 隔离分支和目录 |
+| `agent checkpoint list/show/delete --run <run-id>` | 查看、读取或清理恢复点 |
 
-- `send`
-- `create-topic`
-- `list-topics`
-- `get-topic`
-- `get-run`
-- `cancel-run`
-- `config`
-- `skill`
-- `upload`
-- `teams`
-
-所有命令都支持：
-- `--output raw`
-- `--output jsonl`
+`agent send` 支持 `--format raw`（默认）和 `--format jsonl`。`worktree remove` 默认拒绝删除未提交修改，只有传入 `--force` 才会强制移除。
 
 ---
 
@@ -377,16 +338,18 @@ run(command="...")
 | 记忆 | `memory search/recent/compact/store/facts/forget` | 本地记忆检索与管理 |
 | 话题 | `topic list/info/runs/run/tree/checkout/rename/search` | topic / run 浏览与分支切换 |
 | Skill | `skill list/load/search/create/update/delete` | 经验与指南复用 |
-| 配置 | `config set/delete` | 修改运行配置 |
+| 配置 | `config` | 只读查看当前配置；Agent 运行中不能修改安全策略 |
+| 外部程序 | `shell <program> [arg...]` | 经人工审批、审计、超时和 OS 沙箱执行单一程序 |
 | 系统 | `time`, `help` | 通用辅助 |
 
-支持链式命令：
+内置命令可使用既有命令链解析；但 `shell` 不是 Shell：它只接受一个程序与显式参数，不能使用 `|`、`&&`、`;`、重定向、命令替换或脚本解释器。
 
 ```bash
-run(command="ls && cat notes.md")
-run(command="cat data.txt | grep error | wc -l")
-run(command="write a.txt hello ; write b.txt world")
-run(command="memory compact 7")
+# 合法：执行一个已审批的程序及参数。
+run(command="shell go test ./...")
+
+# 非法：不会启动 Shell，也不会解释管道或命令替换。
+run(command="shell sh -c 'go test ./... | tee test.log'")
 ```
 
 ---
@@ -440,6 +403,7 @@ run(command="memory compact 7")
 - 归档后的旧 run notes
 - topic 文件目录
 - LLM 调用日志
+- 私有 checkpoint 与命令审批审计日志
 
 也就是说：
 - **数据库**更像运行索引和会话存档
@@ -470,17 +434,17 @@ run(command="memory compact 7")
 ## 当前状态
 
 当前版本重点是：
-- 单工具 `run(command)` 的 agent 交互模型
-- 本地文件系统记忆
-- 可回放的 LLM 调用日志
+- 内置 `run(command)` 与受控 `shell <program> [arg...]` 外部执行入口
+- 受管理 Git worktree 隔离、逐命令审批和 OS 沙箱
+- 自动 checkpoint 与可验证的原 worktree 恢复
+- 本地文件系统记忆、可回放的 LLM 调用日志
 - 基于 topic / run 的会话组织方式
 
 如果你准备继续扩展，建议优先看这些文件：
-- `cli-agentx/internal/runtime.go`（分层消息、事件、hooks）
-- `cli-agentx/internal/context.go`（按当前分支构建上下文）
-- `cli-agentx/internal/db.go`（session node / leaf 管理）
-- `cli-agentx/internal/loop.go`（事件化 agent loop）
-- `cli-agentx/internal/memory.go`
-- `cli-agentx/internal/memory_store.go`
-- `cli-agentx/internal/tools.go`
-- `cli-agentx/cmd/agent/send_cmd.go`
+- `internal/runtime.go`（分层消息、事件、hooks）
+- `internal/loop.go`（事件化 Agent loop 与 checkpoint 时机）
+- `internal/checkpoint.go`（检查点持久化与恢复校验）
+- `internal/secure_execution.go`（审批、审计和 OS 沙箱）
+- `internal/worktree.go`（受管理 worktree 生命周期）
+- `internal/tools.go`（内置命令注册表）
+- `cmd/agent/main.go`（CLI 入口与交互式审批）

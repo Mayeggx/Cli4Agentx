@@ -47,6 +47,7 @@ type Config struct {
 	SystemPrompt string                    `yaml:"system_prompt" json:"system_prompt"`
 	Clips        []ClipConfig              `yaml:"clips,omitempty" json:"clips"`
 	Browser      *BrowserConfig            `yaml:"browser,omitempty" json:"browser,omitempty"`
+	Runtime      RuntimeConfig             `yaml:"runtime,omitempty" json:"runtime,omitempty"`
 }
 
 type ConfigJSON struct {
@@ -57,6 +58,7 @@ type ConfigJSON struct {
 	SystemPrompt string                  `json:"system_prompt"`
 	Clips        []ClipJSON              `json:"clips"`
 	Browser      *BrowserConfigJSON      `json:"browser,omitempty"`
+	Runtime      RuntimeConfig           `json:"runtime"`
 }
 
 type ProviderJSON struct {
@@ -136,6 +138,7 @@ func ConfigGetJSON(cfg *Config) ConfigJSON {
 		LLMModel:     cfg.LLMModel,
 		SystemPrompt: cfg.SystemPrompt,
 		Clips:        clips,
+		Runtime:      cfg.Runtime.Normalized(),
 	}
 	if cfg.Browser != nil {
 		result.Browser = &BrowserConfigJSON{Endpoint: cfg.Browser.Endpoint}
@@ -156,6 +159,10 @@ func ConfigGetText(cfg *Config) string {
 	if cfg.Browser != nil && cfg.Browser.Endpoint != "" {
 		fmt.Fprintf(&b, "browser: %s\n", cfg.Browser.Endpoint)
 	}
+	runtime := cfg.Runtime.Normalized()
+	fmt.Fprintf(&b, "sandbox: %s (network=%t, timeout=%ds)\n", runtime.Sandbox.Mode, runtime.Sandbox.AllowNetwork, runtime.Sandbox.TimeoutSeconds)
+	fmt.Fprintf(&b, "command_approval: %s\n", runtime.CommandApproval.Mode)
+	fmt.Fprintf(&b, "worktree: base=%s root=%s\n", runtime.Worktree.BaseBranch, runtime.Worktree.RootDir)
 	for _, c := range cfg.Clips {
 		fmt.Fprintf(&b, "clip: %s (%s)\n", c.Name, strings.Join(c.Commands, ", "))
 	}

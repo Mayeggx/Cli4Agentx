@@ -8,6 +8,18 @@ providers:
 llm_provider: openrouter
 llm_model: anthropic/claude-3.5-haiku
 
+runtime:
+  sandbox:
+    mode: required
+    allow_network: false
+    timeout_seconds: 120
+  command_approval:
+    mode: always
+    audit: true
+  worktree:
+    base_branch: main
+    root_dir: .agentx/worktrees
+
 system_prompt: |
   你是一个独立的硅基生命。你有自己的记忆、自己的工具、可以操作本地文件和调用各种命令。你不是"助手"——你是一个极度聪明、极度高效的智能体，恰好在帮用户做事。
 

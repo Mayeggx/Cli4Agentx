@@ -15,15 +15,21 @@ import (
 const maxIterations = 20
 
 type RunContext struct {
-	DB     *sql.DB
-	RunID  string
-	TopicID string
+	DB           *sql.DB
+	RunID        string
+	TopicID      string
+	ParentNodeID string
+	WorkingDir   string
+	Checkpoints  *CheckpointStore
 }
 
 // RunLoop executes the agentic loop.
 // contextResult comes from BuildContext (pre-assembled system prompt + messages).
 // logger is optional; pass nil to disable LLM call logging.
 func RunLoop(cfg *Config, ctx *ContextResult, registry *Registry, hooks *HookManager, out Output, rc *RunContext, logger *LLMLogger) ([]AgentMessage, error) {
+	if ctx == nil || len(ctx.Messages) == 0 {
+		return nil, fmt.Errorf("agent context requires at least one message")
+	}
 	history := append([]AgentMessage{}, ctx.Messages...)
 	newMsgs := append([]AgentMessage{}, ctx.Messages[len(ctx.Messages)-1])
 	tools := []ToolDef{RunToolDef(registry.Help())}
@@ -47,6 +53,9 @@ func RunLoop(cfg *Config, ctx *ContextResult, registry *Registry, hooks *HookMan
 					out.Event(AgentEvent{Type: "message_end", RunID: runID, Turn: turn, MessageKind: entry.Kind, Message: &entry.Message})
 				}
 			}
+		}
+		if err := saveLoopCheckpoint(checkpointStore(rc), rc, ctx.SystemPrompt, history, turn, "before_llm"); err != nil {
+			return nil, fmt.Errorf("save checkpoint: %w", err)
 		}
 
 		llmHistory, err := hooks.ApplyContext(history)
@@ -110,6 +119,9 @@ func RunLoop(cfg *Config, ctx *ContextResult, registry *Registry, hooks *HookMan
 				history = append(history, toolResult)
 				newMsgs = append(newMsgs, toolResult)
 				out.Event(AgentEvent{Type: "message_end", RunID: runID, Turn: turn, MessageKind: toolResult.Kind, Message: &toolResult.Message})
+				if err := saveLoopCheckpoint(checkpointStore(rc), rc, ctx.SystemPrompt, history, turn, "after_tool"); err != nil {
+					return nil, fmt.Errorf("save checkpoint: %w", err)
+				}
 			}
 			out.Event(AgentEvent{Type: "turn_end", RunID: runID, Turn: turn})
 			continue
@@ -140,6 +152,9 @@ func RunLoop(cfg *Config, ctx *ContextResult, registry *Registry, hooks *HookMan
 			}
 		}
 
+		if err := saveLoopCheckpoint(checkpointStore(rc), rc, ctx.SystemPrompt, history, turn, "completed"); err != nil {
+			return nil, fmt.Errorf("save completion checkpoint: %w", err)
+		}
 		out.Event(AgentEvent{Type: "turn_end", RunID: runID, Turn: turn})
 		out.Event(AgentEvent{Type: "agent_end", RunID: runID, Metadata: map[string]any{"messages": len(newMsgs)}})
 		out.Done()
@@ -286,10 +301,4 @@ func extractImagesFromResult(result string) []ImageData {
 	return images
 }
 
-func truncate(s string, n int) string {
-	r := []rune(s)
-	if len(r) <= n {
-		return s
-	}
-	return string(r[:n]) + "..."
-}
+func truncate(s string, n int)
